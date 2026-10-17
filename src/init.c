@@ -54,8 +54,9 @@ extern void platform_post_init();
 
 #if defined(CONFIG_MMU_REMAP)
 #include "patch.h"
-#include "boot-diag.h"
 #endif
+
+#include "boot-diag.h"
 
 static int _hold_your_horses = 1; // 0 after config is read
 int ml_started = 0; // 1 after ML is fully loaded
