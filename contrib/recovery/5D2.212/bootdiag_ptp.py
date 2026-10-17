@@ -17,7 +17,9 @@ Linux: stop gvfs grabbing the camera first, e.g.
 and run as root or add a udev rule for 04a9.
 
 Usage:
-    bootdiag_ptp.py probe                   (step-by-step connectivity check)
+    bootdiag_ptp.py probe                   (step-by-step connectivity check;
+                                             a timeout wedges the camera's USB,
+                                             so unplug/replug before the next run)
     bootdiag_ptp.py status
     bootdiag_ptp.py log  [out.txt]          (default BOOTDIAG-USB.LOG)
     bootdiag_ptp.py mem  ADDR LEN [out.bin] (hex or decimal)
@@ -163,6 +165,12 @@ def main(argv):
             ("GetDeviceInfo (no session needed)", lambda: "response 0x%04x, %d bytes"
                 % (lambda r: (r[0], len(r[2] or b"")))(ptp.transaction(OP_GET_DEVICE_INFO))),
             ("OpenSession", lambda: "response 0x%04x" % ptp.transaction(OP_OPEN_SESSION, [1])[0]),
+            ("GetStorageIDs 0x1004 (standard op with a real handler)", lambda: "response 0x%04x, %d bytes"
+                % (lambda r: (r[0], len(r[2] or b"")))(ptp.transaction(0x1004))),
+            ("Canon SetRemoteMode 0x9114(1)", lambda: "response 0x%04x" % ptp.transaction(0x9114, [1])[0]),
+            ("Canon SetEventMode 0x9115(1)", lambda: "response 0x%04x" % ptp.transaction(0x9115, [1])[0]),
+            ("Canon GetEvent 0x9116", lambda: "response 0x%04x, %d bytes"
+                % (lambda r: (r[0], len(r[2] or b"")))(ptp.transaction(0x9116))),
             ("control: unknown vendor opcode 0x9FFE (expect 0x2005)",
                 lambda: "response 0x%04x" % ptp.transaction(0x9FFE)[0]),
             ("bootdiag status (0xA1D9, 0)", lambda: "response 0x%04x params %s"
