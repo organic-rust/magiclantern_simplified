@@ -11,11 +11,16 @@
  *               two long pulses instead of one: a log hook failed to install
  *   saved       5 fast blinks   BOOTDIAG.LOG / BOOTDIA2.LOG written to the card
  *
+ *   hooks       k very fast flickers before installing log hook k (1..3)
+ *
  * Log (CONFIG_BOOT_DIAG_LOG, on by default with CONFIG_BOOT_LED_DIAG):
- *   hooks DryosDebugMsg, mpu_send and the MPU receive analyser before
- *   Canon's init_task, records raw arguments (no formatting in the hook),
- *   plus the first context switch of every task. The heartbeat task writes
- *   A:/BOOTDIAG.LOG after ~30 s and A:/BOOTDIA2.LOG after ~120 s.
+ *   after the first heartbeat, buffers come from Canon's heap and the hooks
+ *   (DryosDebugMsg, mpu_send, MPU receive analyser) are installed one per
+ *   heartbeat. Hooking before Canon's init_task stopped a real 5D2, so
+ *   nothing is patched that early. Raw arguments are recorded (no formatting
+ *   in the hook), plus the first context switch of every task seen after
+ *   capture starts. The heartbeat task writes A:/BOOTDIAG.LOG after ~30 s
+ *   and A:/BOOTDIA2.LOG after ~120 s.
  *
  * Addresses are for 5D2 2.1.2 and are checked against the original
  * instruction before hooking.
@@ -115,15 +120,20 @@ struct diag_rec
     uint32_t a[8];
 };
 
-#define LIN_RECS  2400                  /* first records after boot */
-#define RING_RECS 256                   /* most recent records */
+/* allocated from Canon's heap once the heartbeat is running (not in BSS:
+ * on DIGIC 4, ML's BSS is carved out of Canon's malloc pool) */
+#define LIN_RECS_MAX 2000               /* first records after hooking */
+#define RING_RECS    256                /* most recent records */
+#define CHUNK_SIZE   8192
 
-static struct diag_rec lin_buf[LIN_RECS];
-static struct diag_rec ring_buf[RING_RECS];
+static struct diag_rec *lin_buf = 0;
+static struct diag_rec *ring_buf = 0;
+static uint32_t lin_recs = 0;
 static volatile uint32_t lin_n = 0;
 static volatile uint32_t ring_n = 0;
 static volatile uint32_t total_n = 0;
 static volatile int capturing = 0;
+static int capture_start_beat = 0;
 
 #define MAX_SEEN_TASKS 96
 static const char *seen_tasks[MAX_SEEN_TASKS];
@@ -137,7 +147,7 @@ static struct diag_rec *rec_alloc(void)
     uint32_t old = cli();
     uint32_t i = lin_n;
     struct diag_rec *r;
-    if (i < LIN_RECS)
+    if (i < lin_recs)
     {
         lin_n = i + 1;
         r = &lin_buf[i];
@@ -198,10 +208,10 @@ static void log_task(const char *name)
             return;
     if (num_seen_tasks >= MAX_SEEN_TASKS)
         return;
-    seen_tasks[num_seen_tasks++] = name;
 
     struct diag_rec *r = rec_alloc();
     if (!r) return;
+    seen_tasks[num_seen_tasks++] = name;
     r->type = REC_TASK;
     r->a[0] = (uint32_t) name;
 }
@@ -214,15 +224,41 @@ static void log_mark(int stage)
     r->a[0] = stage;
 }
 
-static void install_hooks(void)
+extern void *_AllocateMemory(size_t size);
+
+static char *chunk = 0;
+
+static int alloc_buffers(void)
 {
-    capturing = 1;
-    if (patch_hook_function(ADDR_DEBUGMSG, INSN_DEBUGMSG, hook_debugmsg, "diag DebugMsg"))
-        hook_errors |= 1;
-    if (patch_hook_function(ADDR_MPU_SEND, INSN_MPU_SEND, hook_mpu_send, "diag mpu_send"))
-        hook_errors |= 2;
-    if (patch_hook_function(ADDR_MPU_RX, INSN_MPU_RX, hook_mpu_rx, "diag mpu_rx"))
-        hook_errors |= 4;
+    ring_buf = _AllocateMemory(RING_RECS * sizeof(struct diag_rec));
+    chunk = _AllocateMemory(CHUNK_SIZE);
+    if (!ring_buf || !chunk)
+        return 0;
+
+    for (uint32_t n = LIN_RECS_MAX; n >= 125; n /= 2)
+    {
+        lin_buf = _AllocateMemory(n * sizeof(struct diag_rec));
+        if (lin_buf)
+        {
+            lin_recs = n;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* stage k (1..3): install one hook per heartbeat cycle */
+static void install_hook(int k)
+{
+    int err = 0;
+    switch (k)
+    {
+        case 1: err = patch_hook_function(ADDR_DEBUGMSG, INSN_DEBUGMSG, hook_debugmsg, "diag DebugMsg"); break;
+        case 2: err = patch_hook_function(ADDR_MPU_SEND, INSN_MPU_SEND, hook_mpu_send, "diag mpu_send"); break;
+        case 3: err = patch_hook_function(ADDR_MPU_RX,   INSN_MPU_RX,   hook_mpu_rx,   "diag mpu_rx");   break;
+    }
+    if (err)
+        hook_errors |= 1 << (k - 1);
 }
 
 /* ------------------------------------------------------- log writing */
@@ -262,7 +298,6 @@ static void safe_fmt(char *out, int outsz, const char *fmt, const uint32_t *args
     out[o] = 0;
 }
 
-static char chunk[8192];
 static int chunk_len = 0;
 static FILE *log_f = 0;
 
@@ -283,7 +318,7 @@ static void chunk_flush(void)
 static void emit(const char *line)
 {
     int n = strlen(line);
-    if (chunk_len + n + 1 >= (int) sizeof(chunk))
+    if (chunk_len + n + 1 >= CHUNK_SIZE)
         chunk_flush();
     memcpy(chunk + chunk_len, line, n);
     chunk_len += n;
@@ -361,6 +396,9 @@ static int save_log(const char *filename)
     snprintf(line, sizeof(line), "5D2 boot diag: stage %d, hook errors %x, records %d (first %d + last %d)",
              diag_stage, hook_errors, total_n, lin_n, MIN(ring_n, RING_RECS));
     emit(line);
+    snprintf(line, sizeof(line), "linear buffer %d records; capture started at heartbeat %d",
+             lin_recs, capture_start_beat);
+    emit(line);
     snprintf(line, sizeof(line), "bootflags %x %x %x %x",
              MEM(0xF8000000), MEM(0xF8000004), MEM(0xF8000008), MEM(0xF800000C));
     emit(line);
@@ -374,7 +412,7 @@ static int save_log(const char *filename)
         uint32_t count = MIN(ring_n, RING_RECS);
         uint32_t start = ring_n - count;
         for (uint32_t i = 0; i < count; i++)
-            format_rec(&ring_buf[(start + i) % RING_RECS], LIN_RECS + start + i);
+            format_rec(&ring_buf[(start + i) % RING_RECS], lin_recs + start + i);
     }
 
     chunk_flush();
@@ -398,9 +436,8 @@ void boot_diag_pre_init_task(void)
 {
     diag_blink_spin(2, 3, 5);
     diag_spin(30);
-#ifdef CONFIG_BOOT_DIAG_LOG
-    install_hooks();
-#endif
+    /* nothing else here: hooking ROM before Canon's startup has set up the
+     * caches stopped the camera on real hardware */
 }
 
 /* called from the task dispatch hook on every context switch: keep it cheap */
@@ -430,7 +467,12 @@ void boot_diag_task_seen(const char *name)
 static void diag_heartbeat_task(void *unused)
 {
     int elapsed_ms = 0;
+    int beat = 0;
+#ifdef CONFIG_BOOT_DIAG_LOG
     int saved1 = 0, saved2 = 0;
+    int buffers_ok = 0;
+    int hooks_done = 0;
+#endif
 
     while (1)
     {
@@ -441,12 +483,41 @@ static void diag_heartbeat_task(void *unused)
         diag_blink(n, 150, 300);
         msleep(2000);
         elapsed_ms += pulses * 1200 + n * 450 + 2000;
+        beat++;
 
 #ifdef CONFIG_BOOT_DIAG_LOG
-        /* Canon's own cache flushes can drop our ROM hooks; put them back */
-        sync_caches();
+        if (beat == 1)
+        {
+            buffers_ok = alloc_buffers();
+            if (buffers_ok)
+            {
+                capture_start_beat = beat;
+                capturing = 1;
+            }
+            else
+            {
+                hook_errors |= 8;
+            }
+        }
+        else if (buffers_ok && hooks_done < 3)
+        {
+            /* one hook per beat; k very fast flickers right before hook k,
+             * so a hang can be pinned to the hook that caused it */
+            int k = hooks_done + 1;
+            msleep(500);
+            diag_blink(k, 40, 120);
+            msleep(500);
+            install_hook(k);
+            hooks_done = k;
+        }
 
-        if (!saved1 && elapsed_ms > 30000 && save_log("A:/BOOTDIAG.LOG"))
+        if (hooks_done)
+        {
+            /* Canon's own cache flushes can drop our ROM hooks; put them back */
+            sync_caches();
+        }
+
+        if (buffers_ok && !saved1 && elapsed_ms > 30000 && save_log("A:/BOOTDIAG.LOG"))
         {
             saved1 = 1;
             diag_blink(5, 100, 100);

@@ -23,7 +23,8 @@ normal ML install. Without `BOOT_LED_DIAG=y` nothing changes.
 | 3 slow blinks | ML passed its firmware check and is about to enter Canon's startup code |
 | 2 fast blinks | DryOS is running; Canon's `init_task` is about to be called |
 | repeating: 1 long pulse, then **N** short pulses, then a pause | heartbeat: the scheduler is alive and the furthest milestone task reached is **N** |
-| 2 long pulses instead of 1 at the start of each heartbeat | one of the log hooks failed to install |
+| 1–3 very fast flickers between heartbeats | about to install log hook 1, 2 or 3 (only during the first few heartbeats) |
+| 2 long pulses instead of 1 at the start of each heartbeat | a log hook failed to install, or the log buffers couldn't be allocated |
 | 5 fast blinks | a log file was written to the card |
 
 Brief irregular flickers from card access may appear in between once the card
@@ -34,15 +35,22 @@ No heartbeat after the 2 fast blinks means startup is stuck inside
 
 ## Log files
 
-The same build also records, from just before Canon's `init_task`:
+After the first heartbeat the same build allocates its buffers from Canon's
+heap and installs three hooks, one per heartbeat (with 1, 2, 3 fast flickers
+just before each):
 
-* every `DryosDebugMsg` call (class, level, format and up to 5 arguments)
-* every `mpu_send(buf, size)` (`FF99F518`) with the first 28 bytes sent to the MPU
-* every call into the MPU receive analyser (`FF99BA38`), first 8 words of the decoded message
-* the first context switch of every task, and each milestone
+1. `DryosDebugMsg` (class, level, format and up to 5 arguments)
+2. `mpu_send(buf, size)` (`FF99F518`), first 28 bytes sent to the MPU
+3. the MPU receive analyser (`FF99BA38`), first 8 words of the decoded message
 
-Nothing is formatted inside the hooks; records are stored raw (first 2400 +
-last 256) and formatted by the heartbeat task, which writes:
+plus the first context switch of every task seen after that, and each milestone.
+
+Hooking before Canon's `init_task` (the first version of this) stopped the
+camera with the LED stuck on, so nothing is patched that early any more. If
+the camera stops again, the last flicker count tells which hook did it.
+
+Nothing is formatted inside the hooks; records are stored raw (first up to
+2000 + last 256) and formatted by the heartbeat task, which writes:
 
 * `A:/BOOTDIAG.LOG` about 30 s after startup
 * `A:/BOOTDIA2.LOG` about 120 s after startup
