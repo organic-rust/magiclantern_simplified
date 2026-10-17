@@ -394,6 +394,9 @@ static void format_rec(const struct diag_rec *r, uint32_t seq)
 }
 
 static int save_failures = 0;
+static int ptp_registered = 0;
+static uint32_t ptp_reg_err = 0;
+static volatile uint32_t ptp_calls = 0;
 
 /* header + all records, through emit(); capture paused by the caller */
 static void write_log_body(void)
@@ -404,6 +407,9 @@ static void write_log_body(void)
     emit(line);
     snprintf(line, sizeof(line), "linear buffer %d records; capture started at heartbeat %d; card save failures %d",
              lin_recs, capture_start_beat, save_failures);
+    emit(line);
+    snprintf(line, sizeof(line), "ptp: registered %d, register result %x, calls %d",
+             ptp_registered, ptp_reg_err, ptp_calls);
     emit(line);
     snprintf(line, sizeof(line), "bootflags %x %x %x %x",
              MEM(0xF8000000), MEM(0xF8000004), MEM(0xF8000008), MEM(0xF800000C));
@@ -464,7 +470,6 @@ static int save_log(const char *filename)
 #define PTP_CHUNK (128 * 1024)
 
 extern void _FreeMemory(void *ptr);
-static int ptp_registered = 0;
 
 static int diag_send(struct ptp_context *ctx, const char *buf, int size)
 {
@@ -487,6 +492,7 @@ static int diag_ptp_handler(void *priv, struct ptp_context *ctx,
                             uint32_t param1, uint32_t param2, uint32_t param3,
                             uint32_t param4, uint32_t param5)
 {
+    ptp_calls++;
     struct ptp_msg msg = {
         .id          = PTP_RC_OK,
         .session     = session,
@@ -543,12 +549,16 @@ static int diag_ptp_handler(void *priv, struct ptp_context *ctx,
     return 0;
 }
 
+
+/* returns 0 on success; 0x17 if Canon's PTP framework isn't initialised yet
+ * (its handler table pointer at 0x14178 is still NULL on 5D2 2.1.2) */
 static void diag_ptp_register(void)
 {
     if (ptp_registered)
         return;
-    ptp_register_handler(PTP_BOOTDIAG_CODE, (void *) diag_ptp_handler, 0);
-    ptp_registered = 1;
+    ptp_reg_err = ptp_register_handler(PTP_BOOTDIAG_CODE, (void *) diag_ptp_handler, 0);
+    if (ptp_reg_err == 0)
+        ptp_registered = 1;
 }
 
 #endif /* CONFIG_BOOT_DIAG_LOG */
@@ -653,6 +663,14 @@ static void diag_heartbeat_task(void *unused)
         /* card save attempted and failed: 3 quick flickers after the heartbeat */
         if (save_failures && !saved1)
             diag_blink(3, 60, 140);
+
+        /* PTP readout not registered yet (but should be): 2 quick flickers */
+        if (buffers_ok && diag_stage >= 8 && !ptp_registered)
+            diag_blink(2, 60, 140);
+
+        /* PTP handler has been called at least once: 1 long-ish pulse */
+        if (ptp_calls)
+            diag_blink(1, 500, 300);
 
         if (buffers_ok && !saved1 && elapsed_ms > 30000 && save_log("A:/BOOTDIAG.LOG"))
         {

@@ -27,6 +27,8 @@ normal ML install. Without `BOOT_LED_DIAG=y` nothing changes.
 | 2 long pulses instead of 1 at the start of each heartbeat | a log hook failed to install, or the log buffers couldn't be allocated |
 | 5 fast blinks | a log file was written to the card |
 | 3 quick flickers after each heartbeat | writing the log to the card failed (use USB instead, below) |
+| 2 quick flickers after each heartbeat | USB readout not registered yet (Canon's PTP framework not ready); retried every heartbeat |
+| 1 half-second pulse after each heartbeat | the USB readout handler has been called at least once |
 
 Brief irregular flickers from card access may appear in between once the card
 is mounted (milestone 4 and later).

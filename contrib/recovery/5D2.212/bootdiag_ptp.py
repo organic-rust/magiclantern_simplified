@@ -64,8 +64,13 @@ class PTP:
                 dev.detach_kernel_driver(0)
         except (NotImplementedError, usb.core.USBError):
             pass
-        dev.set_configuration()
-        cfg = dev.get_active_configuration()
+        try:
+            cfg = dev.get_active_configuration()
+            log("device already configured (config %d)" % cfg.bConfigurationValue)
+        except usb.core.USBError:
+            log("setting configuration")
+            dev.set_configuration()
+            cfg = dev.get_active_configuration()
         intf = usb.util.find_descriptor(cfg, bInterfaceClass=6) or cfg[(0, 0)]
         usb.util.claim_interface(dev, intf.bInterfaceNumber)
         self.intf = intf
@@ -83,6 +88,17 @@ class PTP:
         log("interface %d, bulk out 0x%02x, bulk in 0x%02x" %
             (intf.bInterfaceNumber, self.ep_out.bEndpointAddress, self.ep_in.bEndpointAddress))
         self.tid = 0
+
+    def recover(self):
+        """After a timeout: PTP class reset + clear endpoint halts."""
+        for fn, name in ((self.device_reset, "DEVICE_RESET"),
+                         (lambda: self.dev.clear_halt(self.ep_in), "clear halt IN"),
+                         (lambda: self.dev.clear_halt(self.ep_out), "clear halt OUT")):
+            try:
+                fn()
+                log("recover: %s ok" % name)
+            except usb.core.USBError as e:
+                log("recover: %s failed (%s)" % (name, e))
 
     def device_status(self):
         """PTP class request GET_DEVICE_STATUS (0x67): returns the status code."""
@@ -147,6 +163,8 @@ def main(argv):
             ("GetDeviceInfo (no session needed)", lambda: "response 0x%04x, %d bytes"
                 % (lambda r: (r[0], len(r[2] or b"")))(ptp.transaction(OP_GET_DEVICE_INFO))),
             ("OpenSession", lambda: "response 0x%04x" % ptp.transaction(OP_OPEN_SESSION, [1])[0]),
+            ("control: unknown vendor opcode 0x9FFE (expect 0x2005)",
+                lambda: "response 0x%04x" % ptp.transaction(0x9FFE)[0]),
             ("bootdiag status (0xA1D9, 0)", lambda: "response 0x%04x params %s"
                 % (lambda r: (r[0], r[1]))(ptp.transaction(OP_BOOTDIAG, [0]))),
         ]
@@ -156,6 +174,7 @@ def main(argv):
                 print("   OK: %s" % fn(), flush=True)
             except usb.core.USBTimeoutError:
                 print("   TIMEOUT after %d ms - the camera didn't answer this step" % TIMEOUT_MS, flush=True)
+                ptp.recover()
                 try:
                     print("   device status now: 0x%04x" % (ptp.device_status() or 0), flush=True)
                 except usb.core.USBError as e:
@@ -191,6 +210,10 @@ def main(argv):
                 sys.exit("mem read failed: 0x%04x" % rc)
             open(out, "wb").write(data)
             print("wrote %d bytes to %s" % (len(data), out))
+    except usb.core.USBTimeoutError:
+        print("timed out; resetting the PTP pipe", flush=True)
+        ptp.recover()
+        raise
     finally:
         ptp.close()
 
