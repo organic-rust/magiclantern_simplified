@@ -20,6 +20,8 @@ Usage:
     bootdiag_ptp.py probe                   (step-by-step connectivity check;
                                              a timeout wedges the camera's USB,
                                              so unplug/replug before the next run)
+    bootdiag_ptp.py info  [prefix]          (device info, storage, EOS property dump;
+                                             only requests known to work)
     bootdiag_ptp.py status
     bootdiag_ptp.py log  [out.txt]          (default BOOTDIAG-USB.LOG)
     bootdiag_ptp.py mem  ADDR LEN [out.bin] (hex or decimal)
@@ -155,7 +157,7 @@ class PTP:
 
 
 def main(argv):
-    if len(argv) < 2 or argv[1] not in ("probe", "status", "log", "mem"):
+    if len(argv) < 2 or argv[1] not in ("probe", "info", "status", "log", "mem"):
         sys.exit(__doc__)
     ptp = PTP()
 
@@ -171,8 +173,6 @@ def main(argv):
             ("Canon SetEventMode 0x9115(1)", lambda: "response 0x%04x" % ptp.transaction(0x9115, [1])[0]),
             ("Canon GetEvent 0x9116", lambda: "response 0x%04x, %d bytes"
                 % (lambda r: (r[0], len(r[2] or b"")))(ptp.transaction(0x9116))),
-            ("control: unknown vendor opcode 0x9FFE (expect 0x2005)",
-                lambda: "response 0x%04x" % ptp.transaction(0x9FFE)[0]),
             ("bootdiag status (0xA1D9, 0)", lambda: "response 0x%04x params %s"
                 % (lambda r: (r[0], r[1]))(ptp.transaction(OP_BOOTDIAG, [0]))),
         ]
@@ -196,7 +196,30 @@ def main(argv):
 
     ptp.open()
     try:
-        if argv[1] == "status":
+        if argv[1] == "info":
+            prefix = argv[2] if len(argv) > 2 else "5d2"
+            rc, _, di = ptp.transaction(OP_GET_DEVICE_INFO)
+            open(prefix + "-deviceinfo.bin", "wb").write(di or b"")
+            rc, _, sids = ptp.transaction(0x1004)
+            open(prefix + "-storageids.bin", "wb").write(sids or b"")
+            ids = []
+            if sids and len(sids) >= 4:
+                n = struct.unpack_from("<I", sids, 0)[0]
+                ids = list(struct.unpack_from("<%dI" % n, sids, 4))
+            print("storage IDs: %s" % ", ".join("0x%08x" % i for i in ids) or "none")
+            for sid in ids:
+                rc, _, si = ptp.transaction(0x1005, [sid])     # GetStorageInfo
+                print("  storage 0x%08x: GetStorageInfo 0x%04x, %d bytes" % (sid, rc, len(si or b"")))
+                open(prefix + "-storageinfo-%08x.bin" % sid, "wb").write(si or b"")
+            ptp.transaction(0x9114, [1])                       # SetRemoteMode
+            ptp.transaction(0x9115, [1])                       # SetEventMode
+            for i in range(3):
+                rc, _, ev = ptp.transaction(0x9116)            # GetEvent
+                fn = "%s-event%d.bin" % (prefix, i)
+                open(fn, "wb").write(ev or b"")
+                print("GetEvent #%d: 0x%04x, %d bytes -> %s" % (i, rc, len(ev or b""), fn))
+            print("send me the %s-*.bin files" % prefix)
+        elif argv[1] == "status":
             rc, p, _ = ptp.transaction(OP_BOOTDIAG, [0])
             if rc != RC_OK:
                 sys.exit("status failed: 0x%04x (is the BOOT_LED_DIAG build running?)" % rc)
