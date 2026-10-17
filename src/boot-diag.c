@@ -109,8 +109,13 @@ static int name_eq(const char *a, const char *b)
 #define INSN_MPU_SEND   0xE92D41F0
 #define ADDR_MPU_RX     0xFF99BA38      /* MPU receive analyser (ctx, msg *) */
 #define INSN_MPU_RX     0xE92D4070
+#define ADDR_SIO_WORD   0xFF99F658      /* SIO3 ISR -> per-interrupt word handler (word) */
+#define INSN_SIO_WORD   0xE92D4031
+#define MPU_STATUS_REG  0xC022009C      /* polled by Canon's MPU driver itself */
+#define MPU_DRV_STATE   0x88A8          /* driver struct: +0 state (indexes 0x31F44), +8 tx write, +C tx read */
 
-enum { REC_DM = 1, REC_MPU_TX, REC_MPU_RX, REC_TASK, REC_MARK };
+enum { REC_DM = 1, REC_MPU_TX, REC_MPU_RX, REC_TASK, REC_MARK, REC_SIO };
+#define NUM_HOOKS 4
 
 struct diag_rec
 {
@@ -122,7 +127,7 @@ struct diag_rec
 
 /* allocated from Canon's heap once the heartbeat is running (not in BSS:
  * on DIGIC 4, ML's BSS is carved out of Canon's malloc pool) */
-#define LIN_RECS_MAX 2000               /* first records after hooking */
+#define LIN_RECS_MAX 4000               /* first records after hooking */
 #define RING_RECS    256                /* most recent records */
 #define CHUNK_SIZE   8192
 
@@ -201,6 +206,20 @@ static void hook_mpu_rx(uint32_t *regs, uint32_t *stack, uint32_t pc)
         r->a[i] = msg ? msg[i] : 0;
 }
 
+/* every SIO3 (MPU link) interrupt, both directions: r0 = word read from the
+ * MPU data register (0 when the ICU is the one sending) */
+static void hook_sio_word(uint32_t *regs, uint32_t *stack, uint32_t pc)
+{
+    struct diag_rec *r = rec_alloc();
+    if (!r) return;
+    r->type = REC_SIO;
+    r->a[0] = regs[0] & 0xFFFF;
+    r->a[1] = MEM(MPU_STATUS_REG);
+    r->a[2] = MEM(MPU_DRV_STATE);
+    r->a[3] = MEM(MPU_DRV_STATE + 8);
+    r->a[4] = MEM(MPU_DRV_STATE + 0xC);
+}
+
 static void log_task(const char *name)
 {
     for (int i = 0; i < num_seen_tasks; i++)
@@ -247,7 +266,7 @@ static int alloc_buffers(void)
     return 0;
 }
 
-/* stage k (1..3): install one hook per heartbeat cycle */
+/* hook k (1..NUM_HOOKS) */
 static void install_hook(int k)
 {
     int err = 0;
@@ -256,6 +275,7 @@ static void install_hook(int k)
         case 1: err = patch_hook_function(ADDR_DEBUGMSG, INSN_DEBUGMSG, hook_debugmsg, "diag DebugMsg"); break;
         case 2: err = patch_hook_function(ADDR_MPU_SEND, INSN_MPU_SEND, hook_mpu_send, "diag mpu_send"); break;
         case 3: err = patch_hook_function(ADDR_MPU_RX,   INSN_MPU_RX,   hook_mpu_rx,   "diag mpu_rx");   break;
+        case 4: err = patch_hook_function(ADDR_SIO_WORD, INSN_SIO_WORD, hook_sio_word, "diag sio");      break;
     }
     if (err)
         hook_errors |= 1 << (k - 1);
@@ -380,6 +400,11 @@ static void format_rec(const struct diag_rec *r, uint32_t seq)
         case REC_TASK:
             snprintf(line + n, sizeof(line) - n, "TASK %s",
                      ptr_ok(r->a[0]) ? (const char *) r->a[0] : "?");
+            break;
+
+        case REC_SIO:
+            snprintf(line + n, sizeof(line) - n, "SIO word %04x  status %02x  state %d  tx w/r %d/%d",
+                     r->a[0], r->a[1] & 0xFF, r->a[2], r->a[3], r->a[4]);
             break;
 
         case REC_MARK:
@@ -609,8 +634,27 @@ static void diag_heartbeat_task(void *unused)
     int beat = 0;
 #ifdef CONFIG_BOOT_DIAG_LOG
     int saved1 = 0, saved2 = 0;
-    int buffers_ok = 0;
     int hooks_done = 0;
+
+    /* buffers and hooks before the first heartbeat, so the ICU<->MPU
+     * exchange during Canon's startup is captured. (Hooking before
+     * init_task stopped a real 5D2; this runs right after it returns.)
+     * BOOT_DIAG_LATE_HOOKS=y restores one-hook-per-heartbeat installs. */
+    int buffers_ok = alloc_buffers();
+    if (buffers_ok)
+    {
+        capture_start_beat = 0;
+        capturing = 1;
+#ifndef CONFIG_BOOT_DIAG_LATE_HOOKS
+        for (int k = 1; k <= NUM_HOOKS; k++)
+            install_hook(k);
+        hooks_done = NUM_HOOKS;
+#endif
+    }
+    else
+    {
+        hook_errors |= 0x80;
+    }
 #endif
 
     while (1)
@@ -625,23 +669,9 @@ static void diag_heartbeat_task(void *unused)
         beat++;
 
 #ifdef CONFIG_BOOT_DIAG_LOG
-        if (beat == 1)
+#ifdef CONFIG_BOOT_DIAG_LATE_HOOKS
+        if (buffers_ok && hooks_done < NUM_HOOKS)
         {
-            buffers_ok = alloc_buffers();
-            if (buffers_ok)
-            {
-                capture_start_beat = beat;
-                capturing = 1;
-            }
-            else
-            {
-                hook_errors |= 8;
-            }
-        }
-        else if (buffers_ok && hooks_done < 3)
-        {
-            /* one hook per beat; k very fast flickers right before hook k,
-             * so a hang can be pinned to the hook that caused it */
             int k = hooks_done + 1;
             msleep(500);
             diag_blink(k, 40, 120);
@@ -649,6 +679,7 @@ static void diag_heartbeat_task(void *unused)
             install_hook(k);
             hooks_done = k;
         }
+#endif
 
         if (hooks_done)
         {
@@ -659,18 +690,6 @@ static void diag_heartbeat_task(void *unused)
         /* PTP readout: needs the USB/PTP manager (milestone 8) to be running */
         if (buffers_ok && diag_stage >= 8)
             diag_ptp_register();
-
-        /* card save attempted and failed: 3 quick flickers after the heartbeat */
-        if (save_failures && !saved1)
-            diag_blink(3, 60, 140);
-
-        /* PTP readout not registered yet (but should be): 2 quick flickers */
-        if (buffers_ok && diag_stage >= 8 && !ptp_registered)
-            diag_blink(2, 60, 140);
-
-        /* PTP handler has been called at least once: 1 long-ish pulse */
-        if (ptp_calls)
-            diag_blink(1, 500, 300);
 
         if (buffers_ok && !saved1 && elapsed_ms > 30000 && save_log("A:/BOOTDIAG.LOG"))
         {

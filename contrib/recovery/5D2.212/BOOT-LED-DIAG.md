@@ -23,12 +23,8 @@ normal ML install. Without `BOOT_LED_DIAG=y` nothing changes.
 | 3 slow blinks | ML passed its firmware check and is about to enter Canon's startup code |
 | 2 fast blinks | DryOS is running; Canon's `init_task` is about to be called |
 | repeating: 1 long pulse, then **N** short pulses, then a pause | heartbeat: the scheduler is alive and the furthest milestone task reached is **N** |
-| 1–3 very fast flickers between heartbeats | about to install log hook 1, 2 or 3 (only during the first few heartbeats) |
-| 2 long pulses instead of 1 at the start of each heartbeat | a log hook failed to install, or the log buffers couldn't be allocated |
+| 2 long pulses instead of 1 at the start of each heartbeat | a log hook failed to install, or the log buffers couldn't be allocated (details in the log header) |
 | 5 fast blinks | a log file was written to the card |
-| 3 quick flickers after each heartbeat | writing the log to the card failed (use USB instead, below) |
-| 2 quick flickers after each heartbeat | USB readout not registered yet (Canon's PTP framework not ready); retried every heartbeat |
-| 1 half-second pulse after each heartbeat | the USB readout handler has been called at least once |
 
 Brief irregular flickers from card access may appear in between once the card
 is mounted (milestone 4 and later).
@@ -38,22 +34,28 @@ No heartbeat after the 2 fast blinks means startup is stuck inside
 
 ## Log files
 
-After the first heartbeat the same build allocates its buffers from Canon's
-heap and installs three hooks, one per heartbeat (with 1, 2, 3 fast flickers
-just before each):
+When the heartbeat task starts (right after Canon's `init_task` returns) the
+build allocates its buffers from Canon's heap and installs four hooks:
 
 1. `DryosDebugMsg` (class, level, format and up to 5 arguments)
 2. `mpu_send(buf, size)` (`FF99F518`), first 28 bytes sent to the MPU
 3. the MPU receive analyser (`FF99BA38`), first 8 words of the decoded message
+4. the SIO3 interrupt's word handler (`FF99F658`): one `SIO` record per MPU
+   link interrupt with the 16-bit word read from the MPU data register
+   (0 when the ICU is sending), the MPU status register (`C022009C`), the
+   driver state word (`0x88A8`) and the TX queue write/read indexes
 
-plus the first context switch of every task seen after that, and each milestone.
+plus the first context switch of every task, and each milestone. In qemu-eos
+hook 4 fires exactly once per SIO3 interrupt (570 during a boot to the GUI)
+and hook 3 sees 79 of the emulated MPU's 82 messages.
 
 Hooking before Canon's `init_task` (the first version of this) stopped the
-camera with the LED stuck on, so nothing is patched that early any more. If
-the camera stops again, the last flicker count tells which hook did it.
+camera with the LED stuck on, so nothing is patched that early. If this
+early-after-init install causes trouble, build with `BOOT_DIAG_LATE_HOOKS=y`
+to install one hook per heartbeat instead (1–4 fast flickers before each).
 
 Nothing is formatted inside the hooks; records are stored raw (first up to
-2000 + last 256) and formatted by the heartbeat task, which writes:
+4000 + last 256) and formatted by the heartbeat task, which writes:
 
 * `A:/BOOTDIAG.LOG` about 30 s after startup
 * `A:/BOOTDIA2.LOG` about 120 s after startup

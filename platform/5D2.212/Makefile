@@ -26,6 +26,9 @@ ifeq ($(BOOT_LED_DIAG),y)
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/boot-diag.o
 CFLAGS_PLATFORM += -DCONFIG_BOOT_LED_DIAG
 endif
+ifeq ($(BOOT_DIAG_LATE_HOOKS),y)
+CFLAGS_PLATFORM += -DCONFIG_BOOT_DIAG_LATE_HOOKS
+endif
 
 include ../Makefile
 .DEFAULT_GOAL := $(BUILD_DIR)/cam_complete
