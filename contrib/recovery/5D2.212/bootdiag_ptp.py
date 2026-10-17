@@ -17,6 +17,7 @@ Linux: stop gvfs grabbing the camera first, e.g.
 and run as root or add a udev rule for 04a9.
 
 Usage:
+    bootdiag_ptp.py probe                   (step-by-step connectivity check)
     bootdiag_ptp.py status
     bootdiag_ptp.py log  [out.txt]          (default BOOTDIAG-USB.LOG)
     bootdiag_ptp.py mem  ADDR LEN [out.bin] (hex or decimal)
@@ -40,14 +41,23 @@ OP_BOOTDIAG = 0xA1D9
 RC_OK = 0x2001
 RC_SESSION_ALREADY_OPEN = 0x201E
 TYPE_COMMAND, TYPE_DATA, TYPE_RESPONSE = 1, 2, 3
-TIMEOUT_MS = 20000
+TIMEOUT_MS = 5000
+OP_GET_DEVICE_INFO = 0x1001
+VERBOSE = True
+
+
+def log(msg):
+    if VERBOSE:
+        print("[ptp] " + msg, flush=True)
 
 
 class PTP:
     def __init__(self):
+        log("looking for a Canon device (VID 04a9)...")
         dev = usb.core.find(idVendor=CANON_VID, backend=_backend)
         if dev is None:
-            sys.exit("No Canon device found on USB.")
+            sys.exit("No Canon device found on USB (on Windows: is the WinUSB driver installed with Zadig?).")
+        log("found %04x:%04x" % (dev.idVendor, dev.idProduct))
         self.dev = dev
         try:
             if dev.is_kernel_driver_active(0):
@@ -70,7 +80,19 @@ class PTP:
         self.ep_in = ep(usb.util.ENDPOINT_IN, usb.util.ENDPOINT_TYPE_BULK)
         if self.ep_out is None or self.ep_in is None:
             sys.exit("Couldn't find the PTP bulk endpoints.")
+        log("interface %d, bulk out 0x%02x, bulk in 0x%02x" %
+            (intf.bInterfaceNumber, self.ep_out.bEndpointAddress, self.ep_in.bEndpointAddress))
         self.tid = 0
+
+    def device_status(self):
+        """PTP class request GET_DEVICE_STATUS (0x67): returns the status code."""
+        r = self.dev.ctrl_transfer(0xA1, 0x67, 0, self.intf.bInterfaceNumber, 64, TIMEOUT_MS)
+        r = bytes(r)
+        return struct.unpack_from("<H", r, 2)[0] if len(r) >= 4 else None
+
+    def device_reset(self):
+        """PTP class request DEVICE_RESET (0x66)."""
+        self.dev.ctrl_transfer(0x21, 0x66, 0, self.intf.bInterfaceNumber, None, TIMEOUT_MS)
 
     def _send_command(self, code, params):
         self.tid += 1
@@ -86,10 +108,13 @@ class PTP:
 
     def transaction(self, code, params=()):
         """Returns (response code, response params, data or None)."""
+        log("-> op 0x%04x %s" % (code, " ".join("0x%x" % p for p in params)))
         self._send_command(code, list(params))
+        log("   command sent, waiting for the camera...")
         data = None
         while True:
             ctype, rcode, payload = self._read_container()
+            log("   <- container type %d code 0x%04x, %d bytes" % (ctype, rcode, len(payload)))
             if ctype == TYPE_DATA:
                 data = (data or b"") + payload
                 continue
@@ -112,9 +137,36 @@ class PTP:
 
 
 def main(argv):
-    if len(argv) < 2 or argv[1] not in ("status", "log", "mem"):
+    if len(argv) < 2 or argv[1] not in ("probe", "status", "log", "mem"):
         sys.exit(__doc__)
     ptp = PTP()
+
+    if argv[1] == "probe":
+        steps = [
+            ("class request GET_DEVICE_STATUS", lambda: "0x%04x" % (ptp.device_status() or 0)),
+            ("GetDeviceInfo (no session needed)", lambda: "response 0x%04x, %d bytes"
+                % (lambda r: (r[0], len(r[2] or b"")))(ptp.transaction(OP_GET_DEVICE_INFO))),
+            ("OpenSession", lambda: "response 0x%04x" % ptp.transaction(OP_OPEN_SESSION, [1])[0]),
+            ("bootdiag status (0xA1D9, 0)", lambda: "response 0x%04x params %s"
+                % (lambda r: (r[0], r[1]))(ptp.transaction(OP_BOOTDIAG, [0]))),
+        ]
+        for name, fn in steps:
+            print("== %s" % name, flush=True)
+            try:
+                print("   OK: %s" % fn(), flush=True)
+            except usb.core.USBTimeoutError:
+                print("   TIMEOUT after %d ms - the camera didn't answer this step" % TIMEOUT_MS, flush=True)
+                try:
+                    print("   device status now: 0x%04x" % (ptp.device_status() or 0), flush=True)
+                except usb.core.USBError as e:
+                    print("   (device status also failed: %s)" % e, flush=True)
+                break
+            except usb.core.USBError as e:
+                print("   USB error: %s" % e, flush=True)
+                break
+        ptp.close()
+        return
+
     ptp.open()
     try:
         if argv[1] == "status":
