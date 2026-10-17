@@ -315,9 +315,24 @@ static void chunk_flush(void)
     chunk_len = 0;
 }
 
+/* output goes either to the card (chunked) or to a memory buffer (PTP) */
+static char *mem_sink = 0;
+static int mem_len = 0, mem_max = 0;
+static volatile int log_busy = 0;
+
 static void emit(const char *line)
 {
     int n = strlen(line);
+    if (mem_sink)
+    {
+        if (mem_len + n + 1 < mem_max)
+        {
+            memcpy(mem_sink + mem_len, line, n);
+            mem_len += n;
+            mem_sink[mem_len++] = '\n';
+        }
+        return;
+    }
     if (chunk_len + n + 1 >= CHUNK_SIZE)
         chunk_flush();
     memcpy(chunk + chunk_len, line, n);
@@ -378,26 +393,17 @@ static void format_rec(const struct diag_rec *r, uint32_t seq)
     emit(line);
 }
 
-static int save_log(const char *filename)
+static int save_failures = 0;
+
+/* header + all records, through emit(); capture paused by the caller */
+static void write_log_body(void)
 {
-    capturing = 0;
-    msleep(50);
-
-    _FIO_RemoveFile(filename);
-    log_f = _FIO_CreateFile(filename);
-    if (log_f == PTR_INVALID || !log_f)
-    {
-        log_f = 0;
-        capturing = 1;
-        return 0;
-    }
-
     char line[160];
     snprintf(line, sizeof(line), "5D2 boot diag: stage %d, hook errors %x, records %d (first %d + last %d)",
              diag_stage, hook_errors, total_n, lin_n, MIN(ring_n, RING_RECS));
     emit(line);
-    snprintf(line, sizeof(line), "linear buffer %d records; capture started at heartbeat %d",
-             lin_recs, capture_start_beat);
+    snprintf(line, sizeof(line), "linear buffer %d records; capture started at heartbeat %d; card save failures %d",
+             lin_recs, capture_start_beat, save_failures);
     emit(line);
     snprintf(line, sizeof(line), "bootflags %x %x %x %x",
              MEM(0xF8000000), MEM(0xF8000004), MEM(0xF8000008), MEM(0xF800000C));
@@ -414,12 +420,135 @@ static int save_log(const char *filename)
         for (uint32_t i = 0; i < count; i++)
             format_rec(&ring_buf[(start + i) % RING_RECS], lin_recs + start + i);
     }
+}
+
+static int save_log(const char *filename)
+{
+    if (log_busy) return 0;
+    log_busy = 1;
+    capturing = 0;
+    msleep(50);
+
+    _FIO_RemoveFile(filename);
+    log_f = _FIO_CreateFile(filename);
+    if (log_f == PTR_INVALID || !log_f)
+    {
+        log_f = 0;
+        save_failures++;
+        capturing = 1;
+        log_busy = 0;
+        return 0;
+    }
+
+    write_log_body();
 
     chunk_flush();
     FIO_CloseFile(log_f);
     log_f = 0;
     capturing = 1;
+    log_busy = 0;
     return 1;
+}
+
+/* ------------------------------------------------------------ PTP */
+
+/*
+ * Opcode 0xA1D9, works without the card being mounted:
+ *   param1 = 0: status -> response params: stage, hook_errors, total, lin_n, ring_n, save_failures
+ *   param1 = 1: data phase = formatted log text (same as BOOTDIAG.LOG)
+ *   param1 = 2: data phase = raw memory, param2 = address, param3 = length (max 1 MiB)
+ * See contrib/recovery/5D2.212/bootdiag_ptp.py
+ */
+#include "ptp.h"
+#define PTP_BOOTDIAG_CODE 0xA1D9
+#define PTP_CHUNK (128 * 1024)
+
+extern void _FreeMemory(void *ptr);
+static int ptp_registered = 0;
+
+static int diag_send(struct ptp_context *ctx, const char *buf, int size)
+{
+    int total = size;
+    sync_caches();
+    while (size > 0)
+    {
+        int part = MIN(size, PTP_CHUNK);
+        if (ctx->send_data(ctx->handle, (void *) buf, part, total, 0, 0, 0))
+            return 0;
+        total = 0;
+        size -= part;
+        buf += part;
+    }
+    return 1;
+}
+
+static int diag_ptp_handler(void *priv, struct ptp_context *ctx,
+                            uint32_t opcode, uint32_t session, uint32_t transaction,
+                            uint32_t param1, uint32_t param2, uint32_t param3,
+                            uint32_t param4, uint32_t param5)
+{
+    struct ptp_msg msg = {
+        .id          = PTP_RC_OK,
+        .session     = session,
+        .transaction = transaction,
+        .param_count = 0,
+    };
+
+    switch (param1)
+    {
+        case 0:
+            msg.param_count = 5;
+            msg.param[0] = diag_stage;
+            msg.param[1] = hook_errors;
+            msg.param[2] = total_n;
+            msg.param[3] = lin_n;
+            msg.param[4] = ring_n;
+            break;
+
+        case 1:
+        {
+            if (log_busy || !lin_buf) { msg.id = PTP_RC_GeneralError; break; }
+            int max = (lin_n + RING_RECS + 8) * 200;
+            char *buf = _AllocateMemory(max);
+            if (!buf) { msg.id = PTP_RC_GeneralError; break; }
+            log_busy = 1;
+            capturing = 0;
+            mem_sink = buf; mem_len = 0; mem_max = max;
+            write_log_body();
+            mem_sink = 0;
+            capturing = 1;
+            log_busy = 0;
+            if (!diag_send(ctx, buf, mem_len))
+                msg.id = PTP_RC_GeneralError;
+            _FreeMemory(buf);
+            break;
+        }
+
+        case 2:
+            if (!param2 || param3 < 1 || param3 > 0x100000 ||
+                !(ptr_ok(param2) && ptr_ok(param2 + param3 - 1)))
+            {
+                msg.id = PTP_RC_ParameterNotSupported;
+                break;
+            }
+            if (!diag_send(ctx, (const char *) param2, param3))
+                msg.id = PTP_RC_GeneralError;
+            break;
+
+        default:
+            msg.id = PTP_RC_ParameterNotSupported;
+    }
+
+    ctx->send_resp(ctx->handle, &msg);
+    return 0;
+}
+
+static void diag_ptp_register(void)
+{
+    if (ptp_registered)
+        return;
+    ptp_register_handler(PTP_BOOTDIAG_CODE, (void *) diag_ptp_handler, 0);
+    ptp_registered = 1;
 }
 
 #endif /* CONFIG_BOOT_DIAG_LOG */
@@ -516,6 +645,14 @@ static void diag_heartbeat_task(void *unused)
             /* Canon's own cache flushes can drop our ROM hooks; put them back */
             sync_caches();
         }
+
+        /* PTP readout: needs the USB/PTP manager (milestone 8) to be running */
+        if (buffers_ok && diag_stage >= 8)
+            diag_ptp_register();
+
+        /* card save attempted and failed: 3 quick flickers after the heartbeat */
+        if (save_failures && !saved1)
+            diag_blink(3, 60, 140);
 
         if (buffers_ok && !saved1 && elapsed_ms > 30000 && save_log("A:/BOOTDIAG.LOG"))
         {

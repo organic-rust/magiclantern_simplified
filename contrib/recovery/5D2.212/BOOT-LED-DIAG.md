@@ -26,6 +26,7 @@ normal ML install. Without `BOOT_LED_DIAG=y` nothing changes.
 | 1–3 very fast flickers between heartbeats | about to install log hook 1, 2 or 3 (only during the first few heartbeats) |
 | 2 long pulses instead of 1 at the start of each heartbeat | a log hook failed to install, or the log buffers couldn't be allocated |
 | 5 fast blinks | a log file was written to the card |
+| 3 quick flickers after each heartbeat | writing the log to the card failed (use USB instead, below) |
 
 Brief irregular flickers from card access may appear in between once the card
 is mounted (milestone 4 and later).
@@ -60,6 +61,30 @@ blinks), then remove the battery and copy both files off the card.
 The hooks re-apply themselves every heartbeat in case Canon's cache flushes
 remove them. Build with `CFLAGS_PLATFORM += -DCONFIG_NO_BOOT_DIAG_LOG` to get
 the LED codes only.
+
+## Reading the log over USB
+
+If the card can't be written (3 quick flickers after each heartbeat, no
+5-blink signal), the log can be read over USB while the camera sits in the
+black-screen state. Once the USB/PTP manager is running (milestone 8), the
+build registers PTP opcode `0xA1D9`:
+
+| param1 | Returns |
+|---|---|
+| 0 | status in the response parameters: stage, hook errors, records, linear count, ring count |
+| 1 | the formatted log (same text as `BOOTDIAG.LOG`) as the data phase |
+| 2 | raw memory: param2 = address, param3 = length (max 1 MiB) |
+
+```
+pip install pyusb libusb-package
+python bootdiag_ptp.py status
+python bootdiag_ptp.py log            # writes BOOTDIAG-USB.LOG
+python bootdiag_ptp.py mem 0xF0310000 0x1000
+```
+
+On Windows, switch the camera's driver to WinUSB with Zadig first (libusb
+can't open the default WIA/MTP driver); see the comments at the top of the
+script for undoing that.
 
 ## Milestones (N)
 
