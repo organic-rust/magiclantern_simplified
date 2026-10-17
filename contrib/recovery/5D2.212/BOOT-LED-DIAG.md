@@ -23,12 +23,35 @@ normal ML install. Without `BOOT_LED_DIAG=y` nothing changes.
 | 3 slow blinks | ML passed its firmware check and is about to enter Canon's startup code |
 | 2 fast blinks | DryOS is running; Canon's `init_task` is about to be called |
 | repeating: 1 long pulse, then **N** short pulses, then a pause | heartbeat: the scheduler is alive and the furthest milestone task reached is **N** |
+| 2 long pulses instead of 1 at the start of each heartbeat | one of the log hooks failed to install |
+| 5 fast blinks | a log file was written to the card |
 
 Brief irregular flickers from card access may appear in between once the card
 is mounted (milestone 4 and later).
 
 No heartbeat after the 2 fast blinks means startup is stuck inside
 `init_task` itself, or the DryOS scheduler is no longer running.
+
+## Log files
+
+The same build also records, from just before Canon's `init_task`:
+
+* every `DryosDebugMsg` call (class, level, format and up to 5 arguments)
+* every `mpu_send(buf, size)` (`FF99F518`) with the first 28 bytes sent to the MPU
+* every call into the MPU receive analyser (`FF99BA38`), first 8 words of the decoded message
+* the first context switch of every task, and each milestone
+
+Nothing is formatted inside the hooks; records are stored raw (first 2400 +
+last 256) and formatted by the heartbeat task, which writes:
+
+* `A:/BOOTDIAG.LOG` about 30 s after startup
+* `A:/BOOTDIA2.LOG` about 120 s after startup
+
+Leave the camera running for at least two minutes (watch for the 5 fast
+blinks), then remove the battery and copy both files off the card.
+The hooks re-apply themselves every heartbeat in case Canon's cache flushes
+remove them. Build with `CFLAGS_PLATFORM += -DCONFIG_NO_BOOT_DIAG_LOG` to get
+the LED codes only.
 
 ## Milestones (N)
 
