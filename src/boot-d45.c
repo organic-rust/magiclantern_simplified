@@ -62,6 +62,10 @@ copy_and_restart( int offset )
     // Make sure that our self-modifying code clears the cache
     sync_caches();
 
+#ifdef CONFIG_BOOT_LED_DIAG
+    boot_diag_entry();
+#endif
+
     // We enter after the signature, avoiding the
     // relocation jump that is at the head of the data
     thunk reloc_entry = (thunk)( RELOCADDR + 0xC );

@@ -54,6 +54,7 @@ extern void platform_post_init();
 
 #if defined(CONFIG_MMU_REMAP)
 #include "patch.h"
+#include "boot-diag.h"
 #endif
 
 static int _hold_your_horses = 1; // 0 after config is read
@@ -102,6 +103,10 @@ my_task_dispatch_hook(
 
     if (!next_task)
         return;
+
+#ifdef CONFIG_BOOT_LED_DIAG
+    boot_diag_task_seen(next_task->name);
+#endif
 
 #ifdef CONFIG_NEW_DRYOS_TASK_HOOKS
     /* on new DryOS, first argument is not context; get it from the task structure */

@@ -19,5 +19,13 @@ RESTARTSTART = 0x4E000
 
 ML_SRC_EXTRA_OBJS = $(BUILD_DIR)/afma.o $(BUILD_DIR)/asm.o
 
+# Boot progress on the card LED, for cameras that hang with a black screen:
+#   make BOOT_LED_DIAG=y
+# See contrib/recovery/5D2.212/BOOT-LED-DIAG.md
+ifeq ($(BOOT_LED_DIAG),y)
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/boot-diag.o
+CFLAGS_PLATFORM += -DCONFIG_BOOT_LED_DIAG
+endif
+
 include ../Makefile
 .DEFAULT_GOAL := $(BUILD_DIR)/cam_complete

@@ -27,6 +27,8 @@ uint32_t ml_reserved_mem = 0;
 /* optionally used for error handling, if we cannot boot */
 void WEAK_FUNC(ret_0) info_led_blink(int times, int delay_on, int delay_off);
 
+#include "boot-diag.h"
+
 /** Specified by the linker */
 extern uint32_t _bss_start[], _bss_end[];
 extern uint32_t _text_start[], _text_end[];
@@ -85,6 +87,9 @@ static int my_init_task(int a, int b, int c, int d)
     }
 
     // memory check OK, call Canon's init_task
+#ifdef CONFIG_BOOT_LED_DIAG
+    boot_diag_pre_init_task();
+#endif
     qprintf("[BOOT] starting init_task %X...\n", &init_task_func);
     int ans = init_task_func(a,b,c,d);
 
@@ -96,6 +101,11 @@ static int my_init_task(int a, int b, int c, int d)
     while (backup_address == 0);
     while (*backup_address == 0xbaaabaaa);
     *backup_address = backup_data;
+#endif
+
+#ifdef CONFIG_BOOT_LED_DIAG
+    /* before boot_post_init_task, which blocks until Canon's GUI is up */
+    boot_diag_post_init_task();
 #endif
 
     /* regular initialization (usually just launching new tasks) */
