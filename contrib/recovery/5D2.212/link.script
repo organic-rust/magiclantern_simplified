@@ -1,0 +1,16 @@
+/* AUTOEXEC.BIN is loaded and run at 0x800000 (AUTOEXEC_BASE for 5D2.212) */
+ENTRY(_start)
+SECTIONS
+{
+    . = 0x800000;
+    .text :
+    {
+        entry.o(.text)
+        *(.text*)
+        *(.rodata*)
+        *(.data*)
+        *(.bss*)
+        *(COMMON)
+    }
+    /DISCARD/ : { *(.ARM.exidx*) *(.ARM.extab*) *(.comment) *(.note*) *(.ARM.attributes) }
+}
