@@ -623,6 +623,73 @@ FILE* FIO_CreateFile(const char* name)
     return _FIO_CreateFileEx(new_name);
 }
 
+/* 1 if FIO_CreateFileSC uses Canon's speed class mode (see below) */
+int FIO_HasSpeedClass(void)
+{
+    #ifdef CONFIG_FIO_SPEED_CLASS
+    return 1;
+    #else
+    return 0;
+    #endif
+}
+
+#ifdef CONFIG_FIO_SPEED_CLASS
+/* Canon's movie writer creates its file with these: the card goes into
+ * speed class (VSC / SDXC) recording for that file, so the filesystem
+ * allocates free AUs and the card keeps its rated write speed from the
+ * first write (CMD20).  Plain FIO_WriteFile in between. */
+extern FILE *_FIO_CreateFileSC(const char *name);
+extern int _FIO_CloseFileSC(FILE *stream, int drive);
+
+FILE *FIO_CreateFileSC(const char *name)
+{
+    char new_name[FIO_MAX_PATH_LENGTH];
+    if (name == NULL)
+    {
+        return NULL;
+    }
+    fixup_filename(new_name, name, sizeof(new_name));
+    if (new_name[0] == 'A' || new_name[0] == 'B')
+    {
+        /* unlike FIO_CreateFile, it doesn't replace an existing file */
+        _FIO_RemoveFile(new_name);
+        FILE *f = _FIO_CreateFileSC(new_name);
+        if ((int) f > 0)
+        {
+            return f;
+        }
+        printf("CreateFileSC failed: %s\n", new_name);
+    }
+    return _FIO_CreateFileEx(new_name);
+}
+
+void FIO_CloseFileSC(FILE *stream, const char *name)
+{
+    /* drive from the name: FIO_CreateFileSC fell back to a plain file
+     * if it isn't on A: or B: */
+    char new_name[FIO_MAX_PATH_LENGTH];
+    fixup_filename(new_name, name, sizeof(new_name));
+    if (new_name[0] == 'A' || new_name[0] == 'B')
+    {
+        _FIO_CloseFileSC(stream, new_name[0] - 'A');
+    }
+    else
+    {
+        FIO_CloseFile(stream);
+    }
+}
+#else
+FILE *FIO_CreateFileSC(const char *name)
+{
+    return FIO_CreateFile(name);
+}
+
+void FIO_CloseFileSC(FILE *stream, const char *name)
+{
+    FIO_CloseFile(stream);
+}
+#endif
+
 /* Canon stubs */
 extern int _FIO_ReadFile( FILE* stream, void* ptr, size_t count );
 extern int _FIO_WriteFile( FILE* stream, const void* ptr, size_t count );

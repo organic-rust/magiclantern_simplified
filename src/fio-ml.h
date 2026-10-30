@@ -168,6 +168,13 @@ extern int64_t FIO_SeekSkipFile( FILE* stream, int64_t position, int whence );
 // not a handle, and returns NULL on failure, not a negative int.
 extern FILE* FIO_CreateFile( const char* name );
 extern FILE* FIO_CreateFileOrAppend( const char* name );
+
+/* for video files: Canon's speed class recording mode where the model
+ * has it (CONFIG_FIO_SPEED_CLASS), plain FIO_CreateFile otherwise; close
+ * with FIO_CloseFileSC and the same name */
+extern FILE* FIO_CreateFileSC( const char* name );
+extern void FIO_CloseFileSC( FILE* stream, const char* name );
+extern int FIO_HasSpeedClass(void);
 extern int FIO_CopyFile(const char * src, const char * dst);
 extern int FIO_MoveFile(const char * src, const char * dst);   /* copy and erase */
 

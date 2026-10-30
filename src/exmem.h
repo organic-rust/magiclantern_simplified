@@ -43,6 +43,7 @@ struct memSuite * shoot_malloc_suite_contig(size_t size);
 /* num_requested_buffers can be 0 for autodetection */
 struct memSuite * srm_malloc_suite(int num_requested_buffers);
 void srm_free_suite(struct memSuite * suite);
+int srm_is_movrec_memory(void);
 
 /* dump the contents of a memsuite */
 unsigned int exmem_save_buffer(struct memSuite * hSuite, char *file);

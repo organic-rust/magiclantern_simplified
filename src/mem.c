@@ -1067,7 +1067,49 @@ void srm_free_suite(struct memSuite *suite)
     _srm_free_suite(suite);
     give_semaphore(mem_sem);
 }
+#elif defined(CONFIG_MEMORY_SRM_MOVREC)
+/* SRM job memory doesn't work; a camera-specific source stands in */
+extern struct memSuite *movrec_malloc_suite(void);
+extern void movrec_free_suite(struct memSuite *suite);
+
+struct memSuite *srm_malloc_suite(int num_requested_buffers)
+{
+    take_semaphore(mem_sem, 0);
+    struct memSuite *ans = movrec_malloc_suite();
+    give_semaphore(mem_sem);
+    return ans;
+}
+
+void srm_free_suite(struct memSuite *suite)
+{
+    take_semaphore(mem_sem, 0);
+    movrec_free_suite(suite);
+    give_semaphore(mem_sem);
+}
+#else
+/* No SRM: report no memory, so callers that can do without it (mlv_lite)
+ * still load and fall back to other allocators. */
+struct memSuite *srm_malloc_suite(int num_requested_buffers)
+{
+    return NULL;
+}
+
+void srm_free_suite(struct memSuite *suite)
+{
+    ASSERT(suite == NULL);
+}
 #endif // ~CONFIG_MEMORY_SRM_NOT_WORKING
+
+/* 1 if the SRM suite is Canon's movie recorder memory: take it only while
+ * recording (Canon's own movie recording needs it) */
+int srm_is_movrec_memory(void)
+{
+    #ifdef CONFIG_MEMORY_SRM_MOVREC
+    return 1;
+    #else
+    return 0;
+    #endif
+}
 
 struct memSuite *shoot_malloc_suite_contig(size_t size)
 {
