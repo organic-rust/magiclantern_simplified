@@ -1538,14 +1538,31 @@ extern int bv_auto;
     #define CONFIG_MOVIE_EXPO_OVERRIDE_DISABLE_SYNC_WITH_PROPS
 #endif
 
+#ifdef CONFIG_PROP_EXPO_1_768_EV
+/* DIGIC 8 (M6II): ISO, shutter, aperture and AE comp properties are 16-bit
+ * values in 1/768 EV (thirds of a stop * 256): ISO 100 = 0x0F00 (Sv 5),
+ * f/22 = 0x1B00 (Av 9), AE comp -1/3 = 0xFF00.  Convert to ML's 1/8 EV raw
+ * units (raw = 8 EV + APEX offset); 0 stays 0 (auto).  Reading buf[0] as
+ * before took 2 bytes of garbage with the 2-byte properties. */
+static int prop_expo_raw(const void *buf, int len, int apex_offset)
+{
+    int v = (len >= 2) ? *(const uint16_t *)buf : 0;
+    return v ? (v + 48) / 96 + apex_offset : 0;
+}
+#define PROP_EXPO_RAW(apex_offset) prop_expo_raw(buf, len, apex_offset)
+#else
+#define PROP_EXPO_RAW(apex_offset) ((int)buf[0])
+#endif
+
 static int iso_ack = -1;
 PROP_HANDLER( PROP_ISO )
 {
-    if (!CONTROL_BV) lensinfo_set_iso(buf[0]);
+    const int raw = PROP_EXPO_RAW(32);
+    if (!CONTROL_BV) lensinfo_set_iso(raw);
     #ifdef FEATURE_EXPO_OVERRIDE
     else if 
         (
-            buf[0] && !gui_menu_shown()
+            raw && !gui_menu_shown()
             #if defined(ISO_ADJUSTMENT_ACTIVE) || defined(CONFIG_MOVIE_EXPO_OVERRIDE_DISABLE_SYNC_WITH_PROPS)
             && ISO_ADJUSTMENT_ACTIVE
             #endif
@@ -1554,12 +1571,12 @@ PROP_HANDLER( PROP_ISO )
         /* when you adjust ISO from Canon menu, sync expo override too */
         /* this should work even on cameras without manual exposure control, since it's safeguarded by ISO_ADJUSTMENT_ACTIVE */
         /* (that's why ISO_ADJUSTMENT_ACTIVE is mandatory for cameras with CONFIG_NO_MANUAL_EXPOSURE_MOVIE, and optional on others) */
-        bv_set_rawiso(buf[0]);
+        bv_set_rawiso(raw);
     }
     bv_auto_update();
     #endif
     lens_display_set_dirty();
-    iso_ack = buf[0];
+    iso_ack = raw;
 }
 
 void iso_auto_restore_hack()
@@ -1600,28 +1617,29 @@ PROP_HANDLER( PROP_BV ) // camera-specific
 
 PROP_HANDLER( PROP_SHUTTER )
 {
+    const int raw = PROP_EXPO_RAW(56);
     if (!CONTROL_BV) 
     {
         if (shooting_mode != SHOOTMODE_AV && shooting_mode != SHOOTMODE_P)
-            lensinfo_set_shutter(buf[0]);
+            lensinfo_set_shutter(raw);
     }
     #ifdef FEATURE_EXPO_OVERRIDE
-    else if (buf[0]  // sync expo override to Canon values
+    else if (raw  // sync expo override to Canon values
             #if !defined(CONFIG_100D) // any other cameras which need this ?
                                       // symptoms: http://www.magiclantern.fm/forum/index.php?topic=16040.msg187050#msg187050
-            && (ABS(buf[0] - lens_info.raw_shutter) > 3) // some cameras may attempt to round shutter value to 1/2 or 1/3 stops
+            && (ABS(raw - lens_info.raw_shutter) > 3) // some cameras may attempt to round shutter value to 1/2 or 1/3 stops
                                                        // especially when pressing half-shutter
             #endif
         #ifdef CONFIG_MOVIE_EXPO_OVERRIDE_DISABLE_SYNC_WITH_PROPS
         && !is_movie_mode()
         #endif
         #ifdef CONFIG_6D
-        && !(buf[0] == FASTEST_SHUTTER_SPEED_RAW )
+        && !(raw == FASTEST_SHUTTER_SPEED_RAW )
         #endif
 
         )
     {
-        bv_set_rawshutter(buf[0]);
+        bv_set_rawshutter(raw);
     }
     bv_auto_update();
     #endif
@@ -1630,19 +1648,21 @@ PROP_HANDLER( PROP_SHUTTER )
 
 PROP_HANDLER( PROP_APERTURE )
 {
-    //~ NotifyBox(2000, "%x %x %x %x ", buf[0], CONTROL_BV, lens_info.raw_aperture_min, lens_info.raw_aperture_max);
+    const int raw = PROP_EXPO_RAW(8);
+    //~ NotifyBox(2000, "%x %x %x %x ", raw, CONTROL_BV, lens_info.raw_aperture_min, lens_info.raw_aperture_max);
+    lens_info.raw_aperture_setting = raw;
     if (!CONTROL_BV)
     {
-        lensinfo_set_aperture(buf[0]);
+        lensinfo_set_aperture(raw);
     }
     #ifdef FEATURE_EXPO_OVERRIDE
-    else if (buf[0] && !gui_menu_shown()
+    else if (raw && !gui_menu_shown()
         #ifdef CONFIG_MOVIE_EXPO_OVERRIDE_DISABLE_SYNC_WITH_PROPS
         && !is_movie_mode()
         #endif
     )
     {
-        bv_set_rawaperture(COERCE(buf[0], lens_info.raw_aperture_min, lens_info.raw_aperture_max));
+        bv_set_rawaperture(COERCE(raw, lens_info.raw_aperture_min, lens_info.raw_aperture_max));
     }
     bv_auto_update();
     #endif
@@ -1653,19 +1673,20 @@ PROP_HANDLER( PROP_APERTURE_AUTO )
 {
     /* this gets updated in Tv mode (where PROP_APERTURE is not updated); same for P, Auto and so on */
     /* it becomes 0 when camera is no longer metering */
+    const int raw = PROP_EXPO_RAW(8);
 
     if (shooting_mode == SHOOTMODE_M || shooting_mode == SHOOTMODE_AV)
     {
         /* in these modes, aperture is not automatic */
         /* however, this property sometimes becomes 0 in these modes as well, but this is not desired */
-        if (buf[0] == 0)
+        if (raw == 0)
             return;
     }
 
     if (!CONTROL_BV)
     {
         /* expo override turned off? */
-        lensinfo_set_aperture(buf[0]);
+        lensinfo_set_aperture(raw);
     }
 
     lens_display_set_dirty();
@@ -1697,8 +1718,14 @@ PROP_HANDLER( PROP_SHUTTER_AUTO )
 
 PROP_HANDLER( PROP_AE )
 {
+#ifdef CONFIG_PROP_EXPO_1_768_EV
+    /* signed 1/768 EV -> 1/8 EV */
+    const int16_t value = (len >= 2) ? *(const int16_t *) buf : 0;
+    lens_info.ae = (int8_t)((value + (value >= 0 ? 48 : -48)) / 96);
+#else
     const uint32_t value = *(uint32_t *) buf;
     lens_info.ae = (int8_t)value;
+#endif
     update_stuff();
 }
 
@@ -1731,7 +1758,14 @@ static uint16_t custom_wb_gains[128];
 PROP_HANDLER(PROP_CUSTOM_WB)
 {
     ASSERT(len <= sizeof(custom_wb_gains));
-    memcpy(custom_wb_gains, buf, len);
+    memcpy(custom_wb_gains, buf, MIN(len, sizeof(custom_wb_gains)));
+    if (len < 40)
+    {
+        /* M6II: 4 bytes, no gains here; reading gains[16..19] went past
+         * the property (MLV WBAL got 12/8/0).  0 = unknown */
+        lens_info.WBGain_R = lens_info.WBGain_G = lens_info.WBGain_B = 0;
+        return;
+    }
     const uint16_t * gains = (uint16_t *) buf;
     lens_info.WBGain_R = gains[16];
     lens_info.WBGain_G = gains[18];
@@ -1826,7 +1860,15 @@ void split_iso(int raw_iso, unsigned int* analog_iso, int* digital_gain)
 
 void iso_components_update()
 {
+    #if defined(CONFIG_M6II) && defined(FRAME_ISO)
+    /* auto ISO (raw_iso 0): split the ISO the sensor runs at, so MLV's
+     * isoAnalog / digitalGain describe the recorded (HEAD tap, analog
+     * only) data instead of 0 / 0 */
+    split_iso(lens_info.raw_iso ? lens_info.raw_iso : lens_info.raw_iso_auto,
+              &lens_info.iso_analog_raw, &lens_info.iso_digital_ev);
+    #else
     split_iso(lens_info.raw_iso, &lens_info.iso_analog_raw, &lens_info.iso_digital_ev);
+    #endif
 
     lens_info.iso_equiv_raw = lens_info.raw_iso;
 
@@ -1961,6 +2003,27 @@ PROP_HANDLER( PROP_LENS_DYNAMIC_DATA )
     // This can be used to fake PROP_AF_MODE. Works only on lenses with physical AF/MF switch.
     //af_mode = (_dynamic->st2 & 0x80) ? AF_MODE_MANUAL_FOCUS : AF_MODE_ONE_SHOT; // true -> MF, false -> AF
 
+    #ifdef CONFIG_PROP_EXPO_1_768_EV
+    /* M6II: AVO / AVMAX are the lens's widest / smallest aperture at the
+     * current focal length, in 1/768 EV like the exposure properties
+     * (18-55 at 18 mm: AVO 2784 = Av 3.6 = f/3.5, AVMAX 6912 = f/22).
+     * PROP_LENS is empty on this camera, so this is the only range: without
+     * it ML showed Canon's stored setting (f/2.0 from another lens) instead
+     * of the aperture the lens can use.  The setting is clamped again from
+     * Canon's value whenever the range changes (zooming), as Canon does. */
+    int av_min = prop_expo_raw(&_dynamic->AVO, 2, 8);
+    int av_max = prop_expo_raw(&_dynamic->AVMAX, 2, 8);
+    if (av_min && av_max && av_min <= av_max && av_max <= 0xFF &&
+        (av_min != lens_info.raw_aperture_min || av_max != lens_info.raw_aperture_max))
+    {
+        lens_info.raw_aperture_min = av_min;
+        lens_info.raw_aperture_max = av_max;
+        if (lens_info.raw_aperture_setting && !CONTROL_BV)
+        {
+            lensinfo_set_aperture(lens_info.raw_aperture_setting);
+        }
+    }
+    #else
     /*
     // Disabled for now. Requires lens_info rewrite due to storage size change
     lens_info.raw_aperture_min = _dynamic->AVO;
@@ -1970,6 +2033,7 @@ PROP_HANDLER( PROP_LENS_DYNAMIC_DATA )
         int raw = COERCE(lens_info.raw_aperture, lens_info.raw_aperture_min, lens_info.raw_aperture_max);
         lensinfo_set_aperture(raw); // valid limits changed
     } */
+    #endif
 
     // PROP_LENS_DYNAMIC_DATA provides focus near and focus far values.
     // We compute focus dist using harmonic mean ( 2*Dn*Df / (Dn + Df) )
@@ -3114,6 +3178,19 @@ static LVINFO_UPDATE_FUNC(iso_update)
         int lv_iso = (FRAME_ISO & 0xFF) + (get_htp() ? 8 : 0);
         #else
         int lv_iso = lens_info.raw_iso;
+        if (!lens_info.raw_iso)
+        {
+            /* auto ISO, no frame ISO known for this camera: Canon's
+             * auto ISO value, which movie mode only reports after a
+             * half-press (0 otherwise: show just "A") */
+            if (!lens_info.raw_iso_auto)
+            {
+                item->color_fg = COLOR_WHITE;
+                goto iso_done;
+            }
+            lv_iso = lens_info.raw_iso_auto;
+            iso_equiv_raw = lv_iso + digital_gain;
+        }
         #endif
 
         if (ABS(lv_iso - lens_info.raw_iso) > 3)
@@ -3122,6 +3199,7 @@ static LVINFO_UPDATE_FUNC(iso_update)
             iso_equiv_raw += lv_iso - lens_info.raw_iso;
         }
 
+        #ifndef CONFIG_M6II
         if (raw_lv_is_enabled())
         {
             /* the only ISOs used are the full-stop ones;
@@ -3129,6 +3207,20 @@ static LVINFO_UPDATE_FUNC(iso_update)
             iso_equiv_raw = (lv_iso+3)/8*8;
             item->color_fg = COLOR_WHITE;
         }
+        #else
+        /* M6II: analog gain only in full stops up to ISO 6400 (measured at
+         * Mem1's HEAD tap): third stops and 12800/25600 add digital gain
+         * after the tap, which raw (Mem1) doesn't get.  Show the analog
+         * ISO raw records, orange when Canon adds digital gain on top. */
+        if (raw_lv_is_enabled())
+        {
+            unsigned analog;
+            int digital;
+            split_iso(lv_iso, &analog, &digital);
+            iso_equiv_raw = analog;
+            item->color_fg = digital ? COLOR_ORANGE : COLOR_WHITE;
+        }
+        #endif
         
         int iso = raw2iso(iso_equiv_raw);
         
@@ -3139,6 +3231,10 @@ static LVINFO_UPDATE_FUNC(iso_update)
         }
         
         STR_APPEND(buffer, "%d", iso);
+        #ifndef FRAME_ISO
+    iso_done:
+        ;
+        #endif
     }
     else /* photo mode */
     {
@@ -3417,3 +3513,50 @@ static void lens_info_init()
 }
 
 INIT_FUNC("lens_info", lens_info_init);
+
+#ifdef AE_APPLIED_TV
+/* Exposure time Canon's AE applies, from its Tv (1/768 EV), not rounded to
+ * the shutter speed Canon's UI shows (1/50 is 2^-5.625 s = 20263 us).
+ * 0 if unknown. */
+int lens_get_applied_shutter_us(void)
+{
+    int tv = AE_APPLIED_TV;
+    if (tv <= 0 || tv > 768 * 16)
+    {
+        return 0;
+    }
+    return (int)(1000000.0f * powf(2.0f, -tv / 768.0f) + 0.5f);
+}
+
+/* ISO Canon's AE applies (with auto ISO: the one it picked), from Sv */
+int lens_get_applied_iso(void)
+{
+    int sv = AE_APPLIED_SV;
+    if (sv < 768 * 3 || sv > 768 * 14)
+    {
+        return 0;
+    }
+    return (int)(100.0f * powf(2.0f, (sv - 3840) / 768.0f) + 0.5f);
+}
+
+/* applied white balance: colour temperature and Canon's channel gains
+ * (1024 = 1.0); returns 0 if unknown */
+int lens_get_applied_wb(int *kelvin, int *gain_r, int *gain_g, int *gain_b)
+{
+    uint32_t state = MEM(AEWB_STATE_PTR);
+    if (!state)
+    {
+        return 0;
+    }
+    const int16_t *g = (const int16_t *)(state + AEWB_STATE_WB_GAINS);
+    if (g[0] <= 0 || g[1] <= 0 || g[2] <= 0 || g[3] <= 0)
+    {
+        return 0;
+    }
+    *kelvin = WB_APPLIED_KELVIN;
+    *gain_r = g[0];
+    *gain_g = (g[1] + g[2]) / 2;
+    *gain_b = g[3];
+    return 1;
+}
+#endif

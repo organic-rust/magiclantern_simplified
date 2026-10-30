@@ -124,7 +124,13 @@ static CONFIG_INT_EX("audio.input-choice", input_choice,     4, input_choice_on_
 static CONFIG_INT_EX("audio.filters",      enable_filters,   0, enable_filters_on_change ); //disable the HPF, LPF and pre-emphasis filters
 #define cfg_draw_meters 1
 static CONFIG_INT_EX("audio.monitoring",   audio_monitoring, 1, audio_monitoring_var_on_change );
+#if defined(CONFIG_DIGIC_8X)
+/* PROP_LV_ACTION may not come on D8 (not checked); the other conditions
+ * (movie mode, zebra_should_run) already need LiveView */
+static int do_draw_meters = 1;
+#else
 static int do_draw_meters = 0;
+#endif
 
 static struct audio_level audio_levels[2];
 
@@ -383,6 +389,7 @@ static void draw_meters(void)
     draw_meter( x0, y0 + 12, 10, &audio_levels[1], right_label, width);
 #endif
 
+#if !defined(CONFIG_DIGIC_8X)   /* no audio IC registers to read (audio_read_level) */
         if (gui_menu_shown() && alc_enable)
         {
 #ifdef CONFIG_600D
@@ -392,6 +399,7 @@ static void draw_meters(void)
 #endif
             bmp_printf(FONT_MED, 10, 410, "AGC:%s%d.%03d dB", dgain_x1000 < 0 ? "-" : " ", ABS(dgain_x1000) / 1000, ABS(dgain_x1000) % 1000);
         }
+#endif
 }
 
 static LVINFO_UPDATE_FUNC(audio_meter_update)

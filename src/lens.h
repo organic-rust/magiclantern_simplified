@@ -77,6 +77,9 @@ struct lens_info
         uint8_t                 raw_picstyle;           /* fixme: move it out */
         uint8_t                 raw_aperture_min;
         uint8_t                 raw_aperture_max;
+        uint8_t                 raw_aperture_setting;   /* Canon's setting (PROP_APERTURE) before
+                                                         * clamping to the lens; in the padding byte
+                                                         * before flash_ae: no offsets change */
         int                     flash_ae;
         uint16_t                lens_id;
         uint16_t                dof_flags;
@@ -395,7 +398,11 @@ void kelvin_toggle( void* priv, int sign );
 // max ISO that can be set via FRAME_ISO
 // I think it's the same as max analog ISO
 // todo: ask Guillermo Luijk :)
-#if defined(CONFIG_DIGIC_V)
+#if defined(CONFIG_M6II)
+/* measured at Mem1's HEAD tap (before Canon's gain stage): analog gain in
+ * full stops up to ISO 6400; 12800/25600 and third stops are digital */
+#define MAX_ANALOG_ISO 120 // iso 6400
+#elif defined(CONFIG_DIGIC_V)
 #define MAX_ANALOG_ISO 128 // iso 12800
 #else
 #define MAX_ANALOG_ISO 112 // iso 3200
@@ -564,5 +571,10 @@ int job_state_ready_to_take_pic();
 
 /* force an update of PROP_LV_LENS outside LiveView */
 void _prop_lv_lens_request_update();
+
+/* Canon's applied exposure / WB where known (M6II); 0 = unknown */
+int lens_get_applied_shutter_us(void);
+int lens_get_applied_iso(void);
+int lens_get_applied_wb(int *kelvin, int *gain_r, int *gain_g, int *gain_b);
 
 #endif /* _lens_h_ */

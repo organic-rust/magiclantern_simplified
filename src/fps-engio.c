@@ -41,6 +41,7 @@
 #include "raw.h"
 #include "fps.h"
 #include "fps-engio_per_cam.h"
+#include "timer.h"
 #include "shoot.h"
 
 #define PACK(lo, hi) ((lo) & 0x0000FFFF) | (((hi) & 0x0000FFFF) << 16)
@@ -915,6 +916,50 @@ static void fps_setup_timerB(int fps_x1000)
 #endif
 }
 
+/* 1 if fps_get_current_x1000 is measured (smoothed, not a nominal rate) */
+int fps_is_measured(void)
+{
+    #ifdef CONFIG_FPS_MEASURED_FROM_VSYNC
+    return 1;
+    #else
+    return 0;
+    #endif
+}
+
+#ifdef CONFIG_FPS_MEASURED_FROM_VSYNC
+/* No known timing-generator registers (DIGIC 8): measure the LV frame
+ * period between vsyncs, smoothed.  (The timing table is known on the
+ * M6II - VD lines x line period per drive mode and rate - but this
+ * measured value is what the display and timers use.) */
+static volatile uint32_t vsync_period_us = 0;
+static uint64_t last_vsync_us = 0;
+
+void fps_vsync_measure()
+{
+    uint64_t now = get_us_clock();
+    if (last_vsync_us)
+    {
+        uint32_t dt = now - last_vsync_us;
+        if (dt > 2000 && dt < 1000000)
+        {
+            /* about 8 frames to settle after a mode change */
+            vsync_period_us = vsync_period_us ? (vsync_period_us * 7 + dt) / 8 : dt;
+        }
+    }
+    last_vsync_us = now;
+}
+
+/* the vsync interval average as measured, not rounded to a standard rate:
+ * no rounding anywhere (mlv_lite measures each take's exact rate for its
+ * metadata; this one is for the display, sizing and timers) */
+int fps_get_current_x1000()
+{
+    if (!lv || !vsync_period_us)
+        return 0;
+
+    return 1000000000 / vsync_period_us;
+}
+#else
 int fps_get_current_x1000()
 {
     if (!lv)
@@ -923,6 +968,7 @@ int fps_get_current_x1000()
     int fps_x1000 = TIMER_TO_FPS_x1000(fps_timer);
     return fps_x1000;
 }
+#endif
 
 static void calc_rolling_shutter(int * line_ns, int * frame_us, int * frame_percent, int * xres, int * yres);
 

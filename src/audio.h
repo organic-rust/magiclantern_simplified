@@ -631,9 +631,16 @@ struct audio_level
  *
  * Expected values are signed 16-bit?
  */
+#ifdef CONFIG_M6II
+/* Canon's own peak meter (platform/M6II.111/function_overrides.c) */
+extern int m6ii_audio_level(int channel);
+#endif
 static inline int16_t
 audio_read_level( int channel )
 {
+        #if defined(CONFIG_M6II)
+        return m6ii_audio_level(channel);
+        #endif
         #if defined(CONFIG_DIGIC_8X)
         // crashes on DIGIC 8+, untested but doesn't crash on D67
         return 0;

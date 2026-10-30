@@ -13,14 +13,16 @@
 #define DISPLAY_BATTERY_LEVEL_1 60 //%
 #define DISPLAY_BATTERY_LEVEL_2 20 //%
 
+/* small fields as bytes: keeps the core's BSS small (on the M6II it once
+ * sat just below a 256-byte step: errno is aligned to 256 at its end) */
 struct battery_info {
-    int num_of_batt; // 1 if battery is in the body, ? if grip attached
     int level;       // 0-100%
-    int performance; // battery performancee 0?,1,2,3
     int expo;        // expo taken with this charge
     uint32_t serial; // serial number
-    int num_of_hist; // number of registered batterys
-    int act_hist;    // the actual one from the registered, 0: if the battery is not registered
+    int8_t num_of_batt; // 1 if battery is in the body, ? if grip attached
+    int8_t performance; // battery performancee 0?,1,2,3
+    int8_t num_of_hist; // number of registered batterys
+    int8_t act_hist;    // the actual one from the registered, 0: if the battery is not registered
     char name[6];    // LP-E6, ???
 };
 
@@ -32,7 +34,9 @@ struct battery_history {
   int day;           // day        |
 };
 
+#ifndef CONFIG_BATTERY_NO_HISTORY
 static struct battery_history bat_hist[6];
+#endif
 static struct battery_info bat_info;
 
 static CONFIG_INT("battery.drain.rate.rev", battery_seconds_same_level_ok, 108); // initial estimation: 3 hours battery life
@@ -46,11 +50,14 @@ PROP_HANDLER(PROP_BATTERY_REPORT) // also in memory address 7D.203: 7AF60, lengt
     bat_info.serial = (buf[5] & 0xff000000) + SWAP_ENDIAN(buf[6] << 8);
     bat_info.num_of_batt = buf[0];
     bat_info.expo = (buf[2] >> 8) & 0xffff; //expo taken with the battery 
+    #ifndef CONFIG_BATTERY_NO_HISTORY
     for (int i=0;i<MIN(bat_info.num_of_hist,6);i++) 
        if (bat_hist[i].serial == bat_info.serial) bat_info.act_hist = i+1;
+    #endif
     // from buf[2] >> 24 : battery name (byte 11-...) LP-E6 or ???
 }
 
+#ifndef CONFIG_BATTERY_NO_HISTORY
 PROP_HANDLER(PROP_BATTERY_HISTORY) // also in memory address 7D.203: 7AFC0, length 76 bytes
 {
     bat_info.num_of_hist = buf[0];
@@ -65,6 +72,7 @@ PROP_HANDLER(PROP_BATTERY_HISTORY) // also in memory address 7D.203: 7AFC0, leng
         bat_hist[i].day = (buf[3+i*3] >> 16);
     }
 }
+#endif
 
 int GetBatteryLevel()
 {
@@ -126,6 +134,12 @@ void RefreshBatteryLevel_1Hz()
 
 MENU_UPDATE_FUNC(batt_display)
 {
+    #ifdef CONFIG_BATTERY_COARSE
+    /* the report only has Canon's icon levels: no drain estimates */
+    MENU_SET_VALUE("%d%% (Canon's level)", GetBatteryLevel());
+    MENU_SET_ICON(MNI_PERCENT, GetBatteryLevel());
+    return;
+    #endif
     int l = GetBatteryLevel();
     int r = GetBatteryTimeRemaining();
     int d = GetBatteryDrainRate();

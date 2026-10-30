@@ -1147,7 +1147,9 @@ static struct menu_entry debug_menus[] = {
         .name = "Internal Temp",
         .update = efictemp_display,
         .icon_type = IT_ALWAYS_ON,
-	 #ifdef EFIC_CELSIUS
+	 #if defined(EFIC_CELSIUS) && defined(CONFIG_M6II)
+        .help = "Image sensor temperature (Canon's PROP_IMAGE_TEMP, whole degrees).",
+	 #elif defined(EFIC_CELSIUS)
         .help = "EFIC chip temperature (somewhere on the mainboard).",
 	 #else
 	.help = "EFIC chip temperature (raw values).",

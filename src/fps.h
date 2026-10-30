@@ -6,6 +6,7 @@
 // This can return 0, you must check the result before doing division with it.
 // This will crash at least Digic 6 cams (ARMv7-R).
 int fps_get_current_x1000();
+int fps_is_measured(void);
 
 /* current shutter speed, maybe modified by FPS */
 int get_current_shutter_reciprocal_x1000();
