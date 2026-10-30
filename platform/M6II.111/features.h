@@ -9,6 +9,7 @@
 #define FEATURE_DONT_CLICK_ME
 
 #define FEATURE_SHOW_SHUTTER_COUNT
+#define FEATURE_SHOW_CMOS_TEMPERATURE    // image sensor (PROP_IMAGE_TEMP)
 
 // working but incomplete, some allocators don't report
 // anything yet as they're faked / not yet found
@@ -33,6 +34,10 @@
 // Enable remapping ROM pages to RAM
 #define CONFIG_SGI_HANDLERS
 #define CONFIG_MMU_REMAP
+// one static remap page fits (generic_mmu_space; more BSS hung boot):
+// up to 4 more from the heap, 128 kB each, when a module asks before
+// patching (patch_mmu.c mmu_reserve_remap_pages)
+#define CONFIG_MMU_REMAP_EXTRA_PAGES 4
 
 // enable for testing gui structure changes
 //#define CONFIG_RESTORE_AFTER_FORMAT
@@ -42,6 +47,9 @@
 #define CONFIG_IMAGE_CAPTURE_NOT_WORKING
 
 #define FEATURE_PICSTYLE
+
+// raw video via mlv_lite; FEATURE_PICSTYLE above is also required
+#define CONFIG_RAW_LIVEVIEW
 #define CONFIG_PROP_REQUEST_CHANGE
 
 // Fast disk logging
@@ -53,3 +61,7 @@
 #define CONFIG_AUTOBACKUP_ROM
 
 #undef CONFIG_ADDITIONAL_VERSION
+
+// audio level meters in the LiveView top bar (audio-common.c), fed from
+// Canon's peak meter (m6ii_audio_level, function_overrides.c)
+#define FEATURE_AUDIO_METERS

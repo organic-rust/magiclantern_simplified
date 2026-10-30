@@ -10,7 +10,13 @@ def main():
 
     with open(args.hidden_modules_file, "r") as f:
        module_names = [line.strip() for line in f if not line.startswith("#")]
-    
+
+    # The output dir persists between builds, so drop .hid files for modules
+    # that are no longer hidden; otherwise they stay hidden in the zip.
+    for entry in os.listdir(args.modules_dir):
+        if entry.endswith(".hid") and entry[:-len(".hid")] not in module_names:
+            os.remove(os.path.join(args.modules_dir, entry))
+
     for name in module_names:
         hidfile_path = os.path.join(args.modules_dir, name + ".hid")
         open(hidfile_path, 'a').close()

@@ -634,7 +634,8 @@ static MENU_UPDATE_FUNC(flash_and_no_flash_display)
 
 static volatile int afframe_ack = 0;
 #ifdef CONFIG_LIVEVIEW
-static int afframe[128];
+/* PROP_LV_AFFRAME is 1568 bytes on M6II (DIGIC 8); was 128 ints */
+static int afframe[512];
 PROP_HANDLER( PROP_LV_AFFRAME ) {
     ASSERT(len <= sizeof(afframe));
     
@@ -651,7 +652,9 @@ PROP_HANDLER( PROP_LV_AFFRAME ) {
     crop_set_dirty(10);
     afframe_set_dirty();
     
-    memcpy(afframe, buf, len);
+    /* copying len unchecked overran the old 512-byte afframe[] by ~1 KB on
+     * every M6II AF frame update (the ASSERT above only logs) */
+    memcpy(afframe, buf, MIN(len, sizeof(afframe)));
     afframe_ack = 1;
 }
 #else

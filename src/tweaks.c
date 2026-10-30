@@ -1946,7 +1946,11 @@ static void warn_step()
 {
     warn_code = 0;
 
+    #ifdef CONFIG_MOVIE_MODE_FROM_FIXED_MOVIE
+    if (!is_movie_mode())
+    #else
     if (shooting_mode != SHOOTMODE_MOVIE)
+    #endif
     {
         if (warn_mode == 1 && shooting_mode != SHOOTMODE_M)
             warn_code |= 1;

@@ -51,10 +51,36 @@ int get_digic_version(void)
         #endif
 }
 
+/* PROP_CAM_MODEL: older models have the model name at 0 and the model ID
+ * at +32.  DIGIC 8 (M6II) has the make at 0 ("Canon"), the model name at
+ * +6 ("Canon EOS M6 Mark II") and the ID at +0x28 without the 0x80000000
+ * Canon adds elsewhere (0x811; IDs in other ML/MLV places are 0x80000xxx). */
+const char *prop_cam_model_name(const void *buf, int len)
+{
+    const char *s = buf;
+    if (len > 0x2C && strcmp(s, "Canon") == 0 && strncmp(s + 6, "Canon", 5) == 0)
+    {
+        return s + 6;
+    }
+    return s;
+}
+
 PROP_HANDLER(PROP_CAM_MODEL)
 {
-    memcpy((char *)&camera_model_id, (void*)buf + 32, 4);
-    snprintf(camera_model, sizeof(camera_model), (const char *)buf);
+    const char *name = prop_cam_model_name(buf, len);
+    if (name != (const char *)buf)
+    {
+        memcpy((char *)&camera_model_id, (void*)buf + 0x28, 4);
+        if (camera_model_id < 0x10000)
+        {
+            camera_model_id |= 0x80000000;
+        }
+    }
+    else
+    {
+        memcpy((char *)&camera_model_id, (void*)buf + 32, 4);
+    }
+    snprintf(camera_model, sizeof(camera_model), "%s", name);
 }
 
 PROP_HANDLER(PROP_BODY_ID)
@@ -126,6 +152,27 @@ volatile PROP_INT(PROP_AE_MODE_MOVIE, ae_mode_movie);
 volatile int shooting_mode;
 volatile PROP_INT(PROP_SHOOTING_MODE, shooting_mode_custom);
 
+#ifdef CONFIG_MOVIE_MODE_FROM_FIXED_MOVIE
+/* the mode dial doesn't report SHOOTMODE_MOVIE; the firmware keeps
+ * movie mode in its own property.  REC in photo mode switches it to 1 for
+ * Canon's movie (and back after), with PROP_VIDEO_MODE word 8 = 1 for as
+ * long: that is still photo mode for ML (no raw video, no movie
+ * overlays).  PROP_VIDEO_MODE comes ~6 ms after PROP_FIXED_MOVIE, so a
+ * switch to 1 counts only after 300 ms. */
+static volatile int fixed_movie = 0;
+static volatile int fixed_movie_on_ms = 0;
+static volatile int movie_from_photo = 0;
+PROP_HANDLER(PROP_FIXED_MOVIE)
+{
+    int v = buf[0];
+    if (v == 1 && fixed_movie != 1)
+    {
+        fixed_movie_on_ms = get_ms_clock();
+    }
+    fixed_movie = v;
+}
+#endif
+
 // This triggers when the mode dial is rotated,
 // each mode (e.g. Av, Tv, P) returning a presumably
 // unique value.
@@ -161,6 +208,8 @@ bool FAST is_movie_mode()
             && get_expsim() == 2  // movie enabled, but photo display is considered photo mode
             #endif
         ;
+    #elif defined(CONFIG_MOVIE_MODE_FROM_FIXED_MOVIE)
+    return fixed_movie == 1 && !movie_from_photo && get_ms_clock() - fixed_movie_on_ms >= 300;
     #else
     return shooting_mode == SHOOTMODE_MOVIE;
     #endif
@@ -223,6 +272,9 @@ PROP_HANDLER(PROP_VIDEO_MODE)
     #elif defined(CONFIG_DIGIC_678X)
     video_mode_crop = buf[0];
     video_mode_resolution = buf[1];
+    #ifdef CONFIG_MOVIE_MODE_FROM_FIXED_MOVIE
+    movie_from_photo = len >= 0x24 && buf[8] == 1;
+    #endif
     // New cams report more precision for fps, as fps * 100.
     // Old code assumes 2 digits only, e.g. flip_zoom_twostage()
     // Add 50 to round up, so e.g. 29.97 gets reported as 30.

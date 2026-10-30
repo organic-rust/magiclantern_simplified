@@ -3,6 +3,7 @@
 
 extern char __camera_model_short[8];
 extern char camera_model[32];
+const char *prop_cam_model_name(const void *buf, int len);
 extern uint32_t camera_model_id;
 extern char firmware_version[32];
 extern char camera_serial[32];

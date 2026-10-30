@@ -221,6 +221,82 @@ EC811[1]>VramState
 
 // Things definitely wrong.
 // this block all copied from 50D, and probably wrong, though likely safe
+/* LV raw source.  Canon's LiveViewDrive::Mem1Path writes the head of the
+ * LV pipeline (raw type HEAD: before channel gains, white balance, shading
+ * and defect correction) through EDMAC channel 3, EDOMAIN_EDMAC_1_WR_M1,
+ * every frame: 1080p 2384x1348 at 14 bit, optical black at columns 0-47
+ * and rows 0-35, RGGB from (0, 0).  Its pack unit is set from Mem1Path's
+ * state (0x10970 + 0x6C: f0, f1, f2 = depth code, f3, f4; register
+ * f1<<20 | f4<<16 | f0<<8 | f2<<4 | f3), every frame.  f1 = 1, f3 = 0:
+ * ML's 16-bit word layout (Canon's setting); f1 = 0, f3 = 1: the D8
+ * LSB-first layout the CR3 encoder reads.  Both hold at 14, 12 and 10
+ * bit (f2 = 2 / 1 / 0); raw.c picks one (raw_lv_request_layout). */
+#define RAW_LV_SOURCE_MEM1
+#ifdef RAW_LV_SOURCE_MEM1
+#define RAW_LV_EDMAC_CHANNEL_ADDR 0xD0420200
+#define RAW_LV_MEM1_STATE         0x10970
+#define RAW_LV_MEM1_PACK_FIELDS   0x6C
+/* Mem1Path's per-frame code (RAM copy, 0x02285904) computes the row size
+ * as width * 7 / 4 (14 bit only) in these two Thumb-2 instructions:
+ * rsb r0, r0, r0, lsl #3 / ubfx r0, r0, #2, #29 */
+#define RAW_LV_MEM1_XB_CODE       0x02285974
+#else
+/* EDMAC channel 1, EDOMAIN_EDMAC_1_WR_L0: Canon's processed LV raw (photo
+ * 1928x932, 1080p 2328x1306, 4K 3488x1958; 12-bit, D8 native layout): white
+ * balanced and corrected, starts on a green row, no optical black. */
+#define RAW_LV_EDMAC_CHANNEL_ADDR 0xD0420000
+/* EDMAC channel 48, EDOMAIN_EDMAC_2_RD_M0: Canon's LV display reads the raw
+ * buffer back (USB register scan); raw.c keeps its depth matched. */
+#define RAW_LV_READER_EDMAC_CHANNEL_ADDR 0xD0440300
+#endif
+
+/* Canon's applied exposure and white balance (AutoExposure, found over
+ * USB by setting ISO / shutter / WB with PTP and diffing RAM).  Tv and Sv
+ * in 1/768 EV: ISO 100 = 3840, 1/50
+ * (Canon's 1/8 EV code) = 4320 = 2^-5.625 s.  Sv is the ISO auto ISO
+ * picked.  WB: Canon's colour temperature of the applied gains, and the
+ * gains themselves (R, G1, G2, B; 1024 = 1.0) in the AE/WB state. */
+#define AE_APPLIED_TV       (*(volatile int16_t *) 0x8B2BC)
+#define AE_APPLIED_SV       (*(volatile int16_t *) 0x8B2C4)
+#define WB_APPLIED_KELVIN   (*(volatile int32_t *) 0x8B2D0)
+#define AEWB_STATE_PTR      0xAA40
+#define AEWB_STATE_WB_GAINS 0x84
+
+/* CR3 encoder (src/crx_enc.c): AlgsMgr state pointer and its
+ * per-encoder-id "set up" flags */
+#define ALGS_STATE_PTR      0x5BBC
+#define ALGS_ENC_INITED     0x138
+/* decoder slots: AlgsMgrState.c DecInit (0xE02AEEF2) picks the slot by
+ * matching the width with these, in one table for lossless (CMP1 levels 0:
+ * +0x5C 7128 -> 4, +0x60 1624 -> 5, +0x70 7136 -> 9, ...; an unknown width
+ * asserts) and one for C-RAW (levels > 0: +0x64 7128 -> 6, +0x68 1624 -> 7,
+ * +0x8C -> 0x10, +0x9C -> 0x14; an unknown width gets slot 0x17, which
+ * froze the camera).  Slots 5 and 7 are Canon's single-tile reduced raws
+ * (1624); a slot's set-up flag is ALGS_ENC_INITED + slot * 4 like the
+ * encoders' */
+#define ALGS_DEC_WIDTH_SLOT5 0x60
+#define ALGS_DEC_SLOT5       5
+#define ALGS_DEC_WIDTH_SLOT7 0x68
+#define ALGS_DEC_SLOT7       7
+/* CRaw driver work arena (globals pointer 0x143B8 -> struct): +0x8 base,
+ * +0xC size (0x18000), +0x14 free pointer.  Every decoder slot set-up
+ * (SetDecBuf 0xE02FF84C) takes its tables from it; when it runs out the
+ * set-up fails and Canon asserts (AlgsMgrExec.c:2130) */
+#define CRAW_GLOBALS_PTR     0x143B8
+/* the 'bl assert' after "DecErr %08x" in the decode result handler
+ * (0xE02545BA, AlgsMgrState.c:1245); the handler carries on after it */
+#define ALGS_DECERR_ASSERT_BL     0xE02545EC
+#define ALGS_DECERR_ASSERT_BL_OLD 0xF852F3D2
+
+#ifndef RAW_LV_SOURCE_MEM1
+/* Channel 1's LV raw has no optical black area to measure from.  Lens cap,
+ * 1080p: 12-bit values 117..139, mean 127.5, stdev ~2 => 512 / 8.0 at
+ * 14 bit.  raw.c scales these to the stream's actual bit depth.  (Mem1
+ * has optical black; raw.c measures it.) */
+#define RAW_LV_BLACK_LEVEL_14BIT        512
+#define RAW_LV_BLACK_NOISE_14BIT_X100   800
+#endif
+
 #define FASTEST_SHUTTER_SPEED_RAW 160
 #define MAX_AE_EV 2
 #define FLASH_MAX_EV 3
@@ -254,3 +330,20 @@ EC811[1]>VramState
 //#define MVR_LAST_FRAME_SIZE (*(int*)(512 + MVR_752_STRUCT))
 #define MVR_BYTES_WRITTEN MEM((212 + MVR_190_STRUCT))
     
+
+/* ISO of the current LiveView frame, in ML's raw ISO units (1/8 EV,
+ * ISO 100 = 0x48).  LiveView::SensorDrive's state (0x47CF0, SetTgParam
+ * 0xE06D5D98, "SetCtrlParam(%d, ...)") +0x3C holds the frame's Sv in
+ * 1/768 EV: Canon's AE prints Tv/Av/Sv in the same units ("AEC change",
+ * e.g. 0x10E0 = Tv 1/50, 0xD20 = Av f/4.5, 0x1C20 = Sv 9.38). Raw =
+ * Sv * 8 + 32.  Checked with exposure compensation in M + auto ISO:
+ * 0/-1/+1 EV -> 7200/6448/7920 (ISO 2075/1037/3805). */
+#define FRAME_ISO ((uint8_t)((*(volatile int16_t *)0x47D2C + 48) / 96 + 32))
+
+/* PROP_IMAGE_TEMP (PROP_EFIC_TEMP here): image sensor temperature in deg C
+ * + 128, whole degrees.  Canon's temperature service caches its readings
+ * at 0x2E3F0 (12-byte entries, u16 at +4 in 1/16 deg C): 0 image sensor
+ * (I2C device 0x4A), 1 a constant 23 C (no shutter sensor), 2 / 3 devices
+ * 0x49 / 0x48, 4 the battery.  26 C read 0x9A. */
+#define EFIC_CELSIUS ((int)efic_temp - 128)
+

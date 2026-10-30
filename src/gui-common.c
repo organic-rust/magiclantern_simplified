@@ -320,7 +320,12 @@ int update_bgmt_av_status(struct event * event) {
     if(event == NULL) return -1;
     if(event->obj == NULL) return -1;
     int gmt_int_ev_obj = *(int*)(event->obj);
+    #ifdef CONFIG_MOVIE_MODE_FROM_FIXED_MOVIE
+    /* the mode dial doesn't report movie mode, see is_movie_mode */
+    switch(is_movie_mode() ? SHOOTMODE_MOVIE : shooting_mode) {
+    #else
     switch(shooting_mode) {
+    #endif
         case SHOOTMODE_MOVIE:
         case SHOOTMODE_P:
         case SHOOTMODE_ADEP:

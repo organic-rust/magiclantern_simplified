@@ -105,6 +105,26 @@
 #define MODULE_KEY_UNTOUCH_1_FINGER        (36)
 #define MODULE_KEY_TOUCH_2_FINGER          (37)
 #define MODULE_KEY_UNTOUCH_2_FINGER        (38)
+/* dials and buttons of newer models; meaning of DIAL3/DIAL4 is per camera, see its gui.h.
+ * The Erase button itself arrives as MODULE_KEY_TRASH. */
+#define MODULE_KEY_MAIN_DIAL_LEFT            (39)
+#define MODULE_KEY_MAIN_DIAL_RIGHT           (40)
+#define MODULE_KEY_DIAL3_LEFT                (41)
+#define MODULE_KEY_DIAL3_RIGHT               (42)
+#define MODULE_KEY_DIAL4_LEFT                (43)
+#define MODULE_KEY_DIAL4_RIGHT               (44)
+#define MODULE_KEY_PRESS_MFN                 (45)
+#define MODULE_KEY_UNPRESS_MFN               (46)
+#define MODULE_KEY_PRESS_MFN2                (47)
+#define MODULE_KEY_UNPRESS_MFN2              (48)
+#define MODULE_KEY_PRESS_FUNC                (49)
+#define MODULE_KEY_PRESS_AF_ON               (50)
+#define MODULE_KEY_UNPRESS_AF_ON             (51)
+#define MODULE_KEY_PRESS_AE_LOCK             (52)
+#define MODULE_KEY_UNPRESS_AE_LOCK           (53)
+#define MODULE_KEY_PRESS_AF_POINT            (54)
+#define MODULE_KEY_UNPRESS_AF_POINT          (55)
+#define MODULE_KEY_UNPRESS_ERASE             (56)
 
 int module_translate_key(int key, int dest);
 #define MODULE_KEY_CANON     0

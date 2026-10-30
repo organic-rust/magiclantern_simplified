@@ -1134,6 +1134,9 @@ int FAST module_exec_cbr(unsigned int type)
 #if !defined(BGMT_REC)
 #define BGMT_REC -1
 #endif
+#if !defined(BGMT_REC2)
+#define BGMT_REC2 -1
+#endif
 #if !defined(BGMT_PRESS_ZOOM_IN)
 #define BGMT_PRESS_ZOOM_IN -1
 #endif
@@ -1206,6 +1209,63 @@ int FAST module_exec_cbr(unsigned int type)
 #if !defined(BGMT_UNTOUCH_2_FINGER)
 #define BGMT_UNTOUCH_2_FINGER -1
 #endif
+#if !defined(BGMT_MAIN_DIAL_LEFT)
+#define BGMT_MAIN_DIAL_LEFT -1
+#endif
+#if !defined(BGMT_MAIN_DIAL_RIGHT)
+#define BGMT_MAIN_DIAL_RIGHT -1
+#endif
+#if !defined(BGMT_DIAL3_LEFT)
+#define BGMT_DIAL3_LEFT -1
+#endif
+#if !defined(BGMT_DIAL3_RIGHT)
+#define BGMT_DIAL3_RIGHT -1
+#endif
+#if !defined(BGMT_DIAL4_LEFT)
+#define BGMT_DIAL4_LEFT -1
+#endif
+#if !defined(BGMT_DIAL4_RIGHT)
+#define BGMT_DIAL4_RIGHT -1
+#endif
+#if !defined(BGMT_PRESS_MFN)
+#define BGMT_PRESS_MFN -1
+#endif
+#if !defined(BGMT_UNPRESS_MFN)
+#define BGMT_UNPRESS_MFN -1
+#endif
+#if !defined(BGMT_PRESS_MFN2)
+#define BGMT_PRESS_MFN2 -1
+#endif
+#if !defined(BGMT_UNPRESS_MFN2)
+#define BGMT_UNPRESS_MFN2 -1
+#endif
+#if !defined(BGMT_PRESS_FUNC)
+#define BGMT_PRESS_FUNC -1
+#endif
+#if !defined(BGMT_PRESS_AF_ON)
+#define BGMT_PRESS_AF_ON -1
+#endif
+#if !defined(BGMT_UNPRESS_AF_ON)
+#define BGMT_UNPRESS_AF_ON -1
+#endif
+#if !defined(BGMT_PRESS_AE_LOCK)
+#define BGMT_PRESS_AE_LOCK -1
+#endif
+#if !defined(BGMT_UNPRESS_AE_LOCK)
+#define BGMT_UNPRESS_AE_LOCK -1
+#endif
+#if !defined(BGMT_PRESS_AF_POINT)
+#define BGMT_PRESS_AF_POINT -1
+#endif
+#if !defined(BGMT_UNPRESS_AF_POINT)
+#define BGMT_UNPRESS_AF_POINT -1
+#endif
+#if !defined(BGMT_PRESS_ERASE)
+#define BGMT_PRESS_ERASE -1
+#endif
+#if !defined(BGMT_UNPRESS_ERASE)
+#define BGMT_UNPRESS_ERASE -1
+#endif
 int module_translate_key(int key, int dest)
 {
     MODULE_TRANSLATE_KEY(BGMT_WHEEL_UP             , MODULE_KEY_WHEEL_UP             , dest);
@@ -1217,9 +1277,32 @@ int module_translate_key(int key, int dest)
     MODULE_TRANSLATE_KEY(BGMT_MENU                 , MODULE_KEY_MENU                 , dest);
     MODULE_TRANSLATE_KEY(BGMT_INFO                 , MODULE_KEY_INFO                 , dest);
     MODULE_TRANSLATE_KEY(BGMT_PLAY                 , MODULE_KEY_PLAY                 , dest);
+    /* before BGMT_TRASH, first match wins: where M-Fn stands in for Trash
+     * in ML's own menu code (M6II), modules still get M-Fn as itself and
+     * the real Erase button as TRASH */
+    MODULE_TRANSLATE_KEY(BGMT_PRESS_MFN            , MODULE_KEY_PRESS_MFN            , dest);
+    MODULE_TRANSLATE_KEY(BGMT_PRESS_ERASE          , MODULE_KEY_TRASH                , dest);
     MODULE_TRANSLATE_KEY(BGMT_TRASH                , MODULE_KEY_TRASH                , dest);
+    MODULE_TRANSLATE_KEY(BGMT_MAIN_DIAL_LEFT           , MODULE_KEY_MAIN_DIAL_LEFT           , dest);
+    MODULE_TRANSLATE_KEY(BGMT_MAIN_DIAL_RIGHT          , MODULE_KEY_MAIN_DIAL_RIGHT          , dest);
+    MODULE_TRANSLATE_KEY(BGMT_DIAL3_LEFT               , MODULE_KEY_DIAL3_LEFT               , dest);
+    MODULE_TRANSLATE_KEY(BGMT_DIAL3_RIGHT              , MODULE_KEY_DIAL3_RIGHT              , dest);
+    MODULE_TRANSLATE_KEY(BGMT_DIAL4_LEFT               , MODULE_KEY_DIAL4_LEFT               , dest);
+    MODULE_TRANSLATE_KEY(BGMT_DIAL4_RIGHT              , MODULE_KEY_DIAL4_RIGHT              , dest);
+    MODULE_TRANSLATE_KEY(BGMT_UNPRESS_MFN              , MODULE_KEY_UNPRESS_MFN              , dest);
+    MODULE_TRANSLATE_KEY(BGMT_PRESS_MFN2               , MODULE_KEY_PRESS_MFN2               , dest);
+    MODULE_TRANSLATE_KEY(BGMT_UNPRESS_MFN2             , MODULE_KEY_UNPRESS_MFN2             , dest);
+    MODULE_TRANSLATE_KEY(BGMT_PRESS_FUNC               , MODULE_KEY_PRESS_FUNC               , dest);
+    MODULE_TRANSLATE_KEY(BGMT_PRESS_AF_ON              , MODULE_KEY_PRESS_AF_ON              , dest);
+    MODULE_TRANSLATE_KEY(BGMT_UNPRESS_AF_ON            , MODULE_KEY_UNPRESS_AF_ON            , dest);
+    MODULE_TRANSLATE_KEY(BGMT_PRESS_AE_LOCK            , MODULE_KEY_PRESS_AE_LOCK            , dest);
+    MODULE_TRANSLATE_KEY(BGMT_UNPRESS_AE_LOCK          , MODULE_KEY_UNPRESS_AE_LOCK          , dest);
+    MODULE_TRANSLATE_KEY(BGMT_PRESS_AF_POINT           , MODULE_KEY_PRESS_AF_POINT           , dest);
+    MODULE_TRANSLATE_KEY(BGMT_UNPRESS_AF_POINT         , MODULE_KEY_UNPRESS_AF_POINT         , dest);
+    MODULE_TRANSLATE_KEY(BGMT_UNPRESS_ERASE            , MODULE_KEY_UNPRESS_ERASE            , dest);
     MODULE_TRANSLATE_KEY(BGMT_RATE                 , MODULE_KEY_RATE                 , dest);
     MODULE_TRANSLATE_KEY(BGMT_REC                  , MODULE_KEY_REC                  , dest);
+    MODULE_TRANSLATE_KEY(BGMT_REC2                 , MODULE_KEY_REC                  , dest); /* second record code, where a model has two */
     MODULE_TRANSLATE_KEY(BGMT_PRESS_ZOOM_IN   , MODULE_KEY_PRESS_ZOOMIN         , dest);
     MODULE_TRANSLATE_KEY(BGMT_LV                   , MODULE_KEY_LV                   , dest);
     MODULE_TRANSLATE_KEY(BGMT_PICSTYLE             , MODULE_KEY_PICSTYLE             , dest);
@@ -1284,7 +1367,10 @@ int handle_module_keys(struct event * event)
 {
     int count = 1;
     
-    if (event->param == BGMT_WHEEL_UP || event->param == BGMT_WHEEL_DOWN || event->param == BGMT_WHEEL_LEFT ||  event->param == BGMT_WHEEL_RIGHT)
+    if (event->param == BGMT_WHEEL_UP || event->param == BGMT_WHEEL_DOWN || event->param == BGMT_WHEEL_LEFT ||  event->param == BGMT_WHEEL_RIGHT ||
+        event->param == BGMT_MAIN_DIAL_LEFT || event->param == BGMT_MAIN_DIAL_RIGHT ||
+        event->param == BGMT_DIAL3_LEFT || event->param == BGMT_DIAL3_RIGHT ||
+        event->param == BGMT_DIAL4_LEFT || event->param == BGMT_DIAL4_RIGHT)
     {
         /* on newer cameras, scrollwheel events may come up grouped in a single event */
         /* since we only pass single key events to modules, we have to ungroup these events */

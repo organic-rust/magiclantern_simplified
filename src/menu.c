@@ -6259,10 +6259,20 @@ static struct longpress q_longpress = {
 #endif
 
 #if defined(CONFIG_EOSM)
+/* EOSM's erase is the DOWN button */
+#define ERASE_LONGPRESS_PRESS   BGMT_PRESS_DOWN
+#define ERASE_LONGPRESS_UNPRESS BGMT_UNPRESS_DOWN
+#elif defined(CONFIG_LONG_PRESS_ERASE_MENU)
+/* platform gui.h defines BGMT_PRESS_ERASE / BGMT_UNPRESS_ERASE */
+#define ERASE_LONGPRESS_PRESS   BGMT_PRESS_ERASE
+#define ERASE_LONGPRESS_UNPRESS BGMT_UNPRESS_ERASE
+#endif
+
+#ifdef ERASE_LONGPRESS_PRESS
 static struct longpress erase_longpress = {
-    .long_btn_press     = BGMT_TRASH,           /* long press (500ms) opens ML menu */
-    .short_btn_press    = BGMT_PRESS_DOWN,      /* short press => do a regular "down/erase" */
-    .short_btn_unpress  = BGMT_UNPRESS_DOWN,
+    .long_btn_press     = BGMT_TRASH,               /* long press (500ms) opens ML menu */
+    .short_btn_press    = ERASE_LONGPRESS_PRESS,    /* short press => do a regular "down/erase" */
+    .short_btn_unpress  = ERASE_LONGPRESS_UNPRESS,
     .pos_x = 670,   /* in LiveView */
     .pos_y = 343,   /* above ExpSim */
 };
@@ -6482,9 +6492,9 @@ int handle_longpress_events(struct event * event)
     }
 #endif
 
-#if defined(CONFIG_EOSM)
-    /* also trigger menu by a long press on ERASE (DOWN) */
-    if (event->param == BGMT_PRESS_DOWN)
+#ifdef ERASE_LONGPRESS_PRESS
+    /* also trigger menu by a long press on ERASE */
+    if (event->param == ERASE_LONGPRESS_PRESS)
     {
         if (gui_state == GUISTATE_IDLE && !gui_menu_shown() && !IS_FAKE(event))
         {
@@ -6494,7 +6504,7 @@ int handle_longpress_events(struct event * event)
             return 0;
         }
     }
-    else if (event->param == BGMT_UNPRESS_DOWN)
+    else if (event->param == ERASE_LONGPRESS_UNPRESS)
     {
         erase_longpress.pressed = 0;
     }

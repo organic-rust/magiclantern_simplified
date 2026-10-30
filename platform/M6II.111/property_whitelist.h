@@ -28,9 +28,11 @@
 // deny reads / do not register property handlers for these
 const uint32_t prop_handler_deny[] =
 {
-    PROP_ISO,
+    /* PROP_ISO and PROP_LV_AFFRAME were denied after crashes on Digic 8.
+     * Likely causes, now fixed: ISO is in 1/768 EV units on D8
+     * (CONFIG_PROP_EXPO_1_768_EV), and AFFRAME is 1568 bytes, which
+     * overran shoot.c's 512-byte afframe[] on every update. */
     PROP_MVR_REC_START, // probably related to MVR stubs being all wrong
-    PROP_LV_AFFRAME // so far crash only confirmed on Digic 8
 };
 
 // allow writes / allow prop_request_change() for these:
@@ -48,7 +50,17 @@ const uint32_t prop_write_allow[] =
     PROP_PICSTYLE_SETTINGS_USERDEF2,
     PROP_PICSTYLE_SETTINGS_USERDEF3,
     PROP_PICSTYLE_SETTINGS_AUTO,
-    PROP_PICSTYLE_SETTINGS_FINEDETAIL
+    PROP_PICSTYLE_SETTINGS_FINEDETAIL,
+    /* RAW burst and its pre-shooting (Canon's "Mechaless"): 4-byte 0 / 1,
+     * set by Canon's GUI the same way (0xE0574358 / 0xE0574380 ->
+     * _prop_request_change) */
+    PROP_MECHALESS,
+    PROP_MECHALESS_PRE_REC,
+    /* Canon's movie size and frame rate (PROP_MOVIE_PARAM, 40 bytes: [1]
+     * size 0 = 1080p, 5 = 4K, [2] rate in 1/100 fps, [3] rate / 2):
+     * d8_modes' Sensor mode writes combinations Canon's menu makes, as
+     * Canon's lv_set_movie_resol eventproc (0xE04FDE52) does */
+    PROP_VIDEO_MODE
 };
 
 // anything not listed above will allow reads but not writes

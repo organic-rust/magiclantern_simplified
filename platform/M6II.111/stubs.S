@@ -70,6 +70,8 @@ THUMB_FN(0xe057bd2c, FIO_FindNextEx)
 THUMB_FN(0xe057bdee, FIO_FindClose)
 THUMB_FN(0xe057b9ba, FIO_Flush)
 THUMB_FN(0xe057a8ea, _FIO_GetFileSize64)
+THUMB_FN(0xe057a234, _FIO_CreateFileSC)  // "CreateSC": create + FSUEnterSpeedClass; MovWriter's create
+THUMB_FN(0xe057a810, _FIO_CloseFileSC)   // "CloseSC"(fd, drive 0 = A, 1 = B): close + FSUClearSpeedClass
 
 /** Bitmap **/
 DATA_PTR(0x78c78, bmp_vram_info)  // via EOS RP.
@@ -119,6 +121,46 @@ THUMB_FN(0xe03653a0, memmap_info)
 THUMB_FN(0xe010eb7c, smemShowFix)
 THUMB_FN(0xe03926ec, malloc_info)
 THUMB_FN(0xe0392784, sysmem_info)
+
+/** EDMAC **/
+// Engine::Edmac.c, see include/platform/edmac_channels.h for the channel map.
+// None of these are tested on camera yet.
+// D8 splits D4/D5 SetEDmac into separate address and size calls (as on 200D),
+// and the size call takes the D8 struct edmac_info directly.
+THUMB_FN(0xe0580962,  edmac_set_addr)             // (ch, addr): writes +0xA0. 128 callers
+THUMB_FN(0xe058096e,  edmac_set_size)             // (ch, struct edmac_info *): writes +0x48..+0x70
+THUMB_FN(0xe0580782, _StartEDmac)                 // (ch): reset, then set run bit +0x04; no flags arg
+THUMB_FN(0xe05808c6, _AbortEDmac)                 // (ch, cbr, ctx): async, cbr runs from the EDMAC irq
+THUMB_FN(0xe0580502, _ConnectWriteEDmac)          // (ch, conn): write channels only, via BoomerSelector
+THUMB_FN(0xe05806e4, _ConnectReadEDmac)           // (ch, conn): read channels only, via BoomerVdKick, conn <= 0x18
+THUMB_FN(0xe058011c,  RegisterEDmacCompleteCBR)   // (ch, cbr, ctx): cbr table used by irq handler 0xe05802ba
+THUMB_FN(0xe058043c,  UnregisterEDmacCompleteCBR) // (ch): exact inverse of the above
+THUMB_FN(0xe0581556,  edmac_get_pointer_fw)       // (ch): current transfer address, used by "Mem1 is Not Complete"
+THUMB_FN(0xe0580016,  edmac_channel_init)         // (ch): reset + set direction mode; Canon calls it before connecting
+THUMB_FN(0xe057ff06,  edmac_read_kick)            // (ch): read channels only, control = 0x12; Canon calls it after StartEDmac
+
+/** ResLock **/
+// Engine::EFM_ERSC; LockEntry is 0x24 bytes, resource class = id >> 16
+THUMB_FN(0xe057978a,  CreateResLockEntry)         // (resIds, count). 20 callers
+THUMB_FN(0xe0579972,  LockEngineResources)        // blocks on "EFM_ERSC_STATIC" semaphore if busy
+THUMB_FN(0xe0579a0c,  UnLockEngineResources)
+THUMB_FN(0xe057986e,  DeleteResLockEntry)         // Warp::CommonLib.c calls it right after UnLock
+
+/** EDMAC mem -> mem **/
+// Engine::MemoryToMemoryEsub5.c: one global copy engine on engine 5,
+// read channel 58..63 (5_RD_*) -> write channel 23..25 (5_WR_*),
+// connection 0xC2060A + (read ch - 58).  Canon's Vfx path (0xe0080498)
+// uses read 61 -> write 24, locked by resIds { 0x5001F, 0x50023 }.
+THUMB_FN(0xe0639898,  mem_to_mem_setup_channels)  // ({rd_ch, wr_ch}): init, connect, register internal cbrs
+THUMB_FN(0xe063993c,  set_mem_to_mem_cbr)         // (cbr, ctx): fires when both channels complete
+THUMB_FN(0xe0639946,  set_default_mem_to_mem_cbr)
+THUMB_FN(0xe063996c,  mem_to_mem_set_src_dst)     // ({src, dst})
+THUMB_FN(0xe0639986,  mem_to_mem_setup_copy_d8)   // ({src_info, dst_info, mode}); mode -> 0xe0580dd0, 0..3
+THUMB_FN(0xe0639952,  mem_to_mem_start)           // start write, start read, kick read
+THUMB_FN(0xe0639922,  cleanup_mem_to_mem)         // unregister cbrs, disconnect write channel
+THUMB_FN(0xe0630eb6,  pwrmng_wake_devices)        // (desc): Engine::PwrMng.c; Vfx passes 0xe0cf4980,
+                                                  // dark-current OB copy (0xe061735e) passes 0xe11753cc
+THUMB_FN(0xe0630ee4,  pwrmng_sleep_devices)       // (desc)
 
 /** Misc **/
 THUMB_FN(0xe0587590, uart_printf)
@@ -177,18 +219,52 @@ THUMB_FN(0xe0586774, DeleteMemorySuite)
 THUMB_FN(0xe0586a00, CreateMemorySuite)
 THUMB_FN(0xe0586046, CreateMemoryChunk)
 // SRM use disabled via CONFIG_MEMORY_SRM_NOT_WORKING
+// MovRecResource.c MRAlloc(pool, size, align, file, line): "MRAlloc(%x,%d) : %s(%d)",
+// asserts OUT_OF_SPACE; for movrec_mem.c (CONFIG_MEMORY_SRM_MOVREC)
+THUMB_FN(0xe0264fdc, MovRecAlloc)
 
 /** Uncategorized **/
 DATA_PTR(0x14684, sd_device)
 THUMB_FN(0xe0818adc, _LoadCalendarFromRTC)
 THUMB_FN(0xe08f942e, ErrForCamera_handler)
+THUMB_FN(0xe087f92c, ErrCardForLVApp_handler) // "DlgErrCard.c DELETE_DIALOG_REQUEST"; no DlgLiveViewError.c on D8,
+                                              // this generic card error dialog is the closest; mlv_lite emergency stop
 
 THUMB_FN(0xe0599c42,  dm_set_store_level)
 
 /** Properties **/
 THUMB_FN(0xe058c8dc, _prop_cleanup)
+/* PTP: registers a vendor operation handler (Canon's own: 0x9052...).
+ * Third argument is a notify flag here, not a priv pointer; ML passes 0.
+ * Returns 0x17 until Canon's list exists, 0x13 if already registered. */
+THUMB_FN(0xe026843e, ptp_register_handler)
+
+/** DMA copy: System::HPCopy.c, a pool of Xdmac channels ("[HPC ERROR]
+ * Nothing DMA ch now!", as on 1100D); synchronous (dst, src, size) **/
+THUMB_FN(0xe028ce8a, dma_memcpy)
+
+/** CR3 encoder (Algs::AlgsMgr.c), src/crx_enc.c **/
+THUMB_FN(0xe06662f6, algs_start_encode)         // (jobs, n <= 3, cbr, ctx): posts event 2 to AlgsMgr
+THUMB_FN(0xe0666872, algs_free_enc_buffer)      // (handle, 0, 0): posts event 4
+/** Sound input (Canon's voice memo client, FileMgr::Voice_Hardware.c) **/
+THUMB_FN(0xe03b884e, SoundDevInOpen)            // (params): rate/bits/channels, ring, complete cbr(ctx, info) every 0.5 s
+THUMB_FN(0xe03b8932, SoundDevInStart)
+THUMB_FN(0xe03b894e, SoundDevInStop)            // stop cbr follows
+THUMB_FN(0xe03b896a, SoundDevInClose)
+THUMB_FN(0xe06666ba, algs_start_decode)         // StartDecodeForInner(sample, size, out, out_pitch_px, x, y, cmp1, cmp1_size, cbr, ctx, 0, 0): posts event 0
+THUMB_FN(0xe0666778, algs_get_encode_data)      // (handle, &n, &addrs, &sizes): handle[6..8]; 7 if bad signature ("mvrGetCRXEncodeDataCBR")
 THUMB_FN(0xe058c332, prop_register_slave)
 THUMB_FN(0xe058c400, _prop_request_change)
+/* debug eventproc "lv_set_fixed_movie" (table at 0xE151797C): (&v) logs
+ * "SetFixedMovie(%d)", sets PROP_FIXED_MOVIE = v and 0x8004001C = v ? 2 : 1;
+ * LiveView changes mode only at its next start (lv_mode.c) */
+THUMB_FN(0xe04fdda0, lv_set_fixed_movie)
+/* Canon's getter (prop, &ptr, &len), 0 = found.  d8_modes reads
+ * PROP_MOVIE_PARAM's value with it at start-up: module property handlers
+ * only see changes, not the current value (they are added after Canon
+ * delivered the current values to ML's registration).  Other ports leave
+ * it commented out as possibly unsafe; it's used once, from a task. */
+THUMB_FN(0xe058c9c6, prop_get_value)
 
 /**
  * Things needed for CONFIG_COMPOSITOR_XCM / CONFIG_XCM_DEDICATED_LAYER
@@ -229,3 +305,12 @@ DATA_PTR(0xf0b4, LiveViewApp_dialog)
 
 // Not used at this moment
 //THUMB_FN(0xe0524ad8, DISP_SetHighLight)
+
+/** Audio **/
+THUMB_FN(0xe02df628, AprocCtrl_GetLevelPeak)            // [APROC] Level[%x,%x][%x,%x]; out u16[8], mode 2 = stereo
+
+/** Xdmac scatter-gather (System::HPCopy pool, Peripheral::Xdmac(Transfer).c) **/
+THUMB_FN(0xe028ce4e, hpc_pool_get)                  // -> entry (entry[0] = Xdmac channel), marks it busy; 0 if none
+THUMB_FN(0xe028d410, hpc_pool_release)              // (entry)
+THUMB_FN(0xe030be86, xdmac_desc_prep)               // (desc): zeroes words 4-9 of a 0x28-byte {dst, src, size, flags} descriptor
+THUMB_FN(0xe0332f36, xdmac_transfer_async)          // ({ch, desc[], n} *, 1, cbr, ctx, 0); n <= 8; -2 if the channel is busy

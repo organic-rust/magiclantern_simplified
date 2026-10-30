@@ -118,6 +118,10 @@
 #define PROP_MODE               0x80000001 // maybe; set in FA_DISP_COM
 
 #define PROP_DRIVE              0x80000003
+/* M6II RAW burst ("Mechaless") on / off and its pre-shooting on / off;
+ * 0x80040013 (flash) follows the first */
+#define PROP_MECHALESS          0x80020061
+#define PROP_MECHALESS_PRE_REC  0x8002007F
 #define DRIVE_SINGLE 0
 #define DRIVE_SELFTIMER_REMOTE 0x10
 #ifdef CONFIG_5DC
@@ -200,6 +204,10 @@
 
 #ifdef CONFIG_5DC
 #define PROP_EFIC_TEMP          0x80030013
+#elif defined(CONFIG_M6II)
+/* PROP_IMAGE_TEMP: the image sensor's I2C thermometer (device 0x4A), deg C
+ * + 128, from Canon's temperature service */
+#define PROP_EFIC_TEMP          0x8003009E
 #else
 #define PROP_EFIC_TEMP          0x80030014
 #endif
@@ -609,6 +617,7 @@
 #define PROP_AFSHIFT_LVASSIST_SHIFT_RESULT 0x8003003E 
 #define PROP_MULTIPLE_EXPOSURE_CTRL 0x80070001
 #define PROP_MIRROR_DOWN_IN_MOVIE_MODE 0x80030034
+#define PROP_FIXED_MOVIE 0x80030037 // D8 (M6II): 1 = movie mode, 0 = photo; firmware logs "PROP_FIXED_MOVIE on/off"
 
 //~ #define PROP_CARD2_CLUSTER_SIZE 0x2010007
 #define PROP_SHUTTER_COUNTER 0x80030029

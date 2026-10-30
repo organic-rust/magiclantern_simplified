@@ -203,6 +203,8 @@ static void tskmon_stack_checker(struct task *next_task)
         #if defined(CONFIG_M6II)
         if (streq(task_name, "HeartBeat0") && free > 192)
             return; // uses 264 of 512, 248 free
+        if (streq(task_name, "FmidTask") && free > 64)
+            return; // uses 1956 of 2048, 92 free; Canon's own frames at the peak
         #endif
 
         bmp_printf(FONT(FONT_MED, free < 128 ? COLOR_RED : COLOR_WHITE, COLOR_BLACK), 0, 0, 
