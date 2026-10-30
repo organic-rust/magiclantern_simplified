@@ -46,6 +46,21 @@
 #include "../../lv_rec/lv_rec.h"
 #include "../../raw_twk/raw_twk.h"
 #include "../../silent/lossless.h"
+#include <raw_layout.h>
+
+/* DIGIC 8 builds have no Canon LJ92 decoder stub (and record CRX, not
+ * LJ92): without it, LJ92 frames say "no decompression on this model" */
+static int mlv_play_no_lj92() { return -1; }
+extern int lossless_decompress_raw(struct memSuite * source_suite, void * dest, int width, int height, int output_bpp)
+    __attribute__((weak, alias("mlv_play_no_lj92")));
+extern WEAK_FUNC(ret_0) void raw_set_layout(int layout);
+/* DIGIC 8: Canon's CR3 decoder (src/crx_enc.c) */
+static int mlv_play_no_crx() { return -1; }
+extern int crx_dec_frame(void *sample, int size, void *out, int width, int height, int bits, int pitch_px)
+    __attribute__((weak, alias("mlv_play_no_crx")));
+static void mlv_play_no_crx_done() { }
+extern void crx_dec_done(void) __attribute__((weak, alias("mlv_play_no_crx_done")));
+extern WEAK_FUNC(ret_0) int raw_get_layout(void);
 #include "console.h"
 
 /* uncomment for live debug messages */
@@ -149,6 +164,8 @@ typedef struct
     uint16_t bitDepth;
     uint16_t blackLevel;
     uint16_t whiteLevel;
+    uint16_t layout;        /* RAW_LAYOUT_ML, or RAW_LAYOUT_LSB for decoded CRX frames */
+    uint16_t skip;          /* nothing to show (an empty frame, or CRX without a decoder) */
 } frame_buf_t;
 
 /* set up two queues - one with empty buffers and one with buffers to render */
@@ -651,7 +668,10 @@ static uint32_t mlv_play_osd_draw()
     
     uint32_t w = bmp_string_width(FONT_LARGE, osd_line);
     uint32_t h = fontspec_height(FONT_LARGE);
-    bmp_fill(COLOR_EMPTY, mlv_play_osd_x - w/2 - border, mlv_play_osd_y - border, w + 2 * border, h + 2 * border);
+    if(osd_line[0])
+    {
+        bmp_fill(COLOR_EMPTY, mlv_play_osd_x - w/2 - border, mlv_play_osd_y - border, w + 2 * border, h + 2 * border);
+    }
     
     /* handle animation */
     switch(mlv_play_osd_state)
@@ -665,9 +685,12 @@ static uint32_t mlv_play_osd_draw()
         case MLV_PLAY_MENU_HIDDEN:
         case MLV_PLAY_MENU_IDLE:
         {
-            mlv_play_osd_y = os.y_max + 1;
-            redraw = 0;
-            break;
+            /* where fading in starts; nothing is drawn while hidden: the
+             * screen goes on past os.y_max (on the M6II a bar parked just
+             * below it stayed half visible) */
+            mlv_play_osd_y = BMP_H_PLUS - (int) h;
+            osd_line[0] = 0;
+            return 0;
         }
         
         case MLV_PLAY_MENU_FADEIN:
@@ -684,11 +707,16 @@ static uint32_t mlv_play_osd_draw()
         
         case MLV_PLAY_MENU_FADEOUT:
         {
-            int y_bottom = os.y_max + 1;
-            mlv_play_osd_y = MIN(mlv_play_osd_y + border, y_bottom);
-            if(mlv_play_osd_y >= y_bottom)
+            /* slide down as far as the bitmap goes (its text must not run
+             * past BMP_H_PLUS), then the bar is undrawn: os.y_max isn't
+             * the bottom of what's visible */
+            int y_bottom = BMP_H_PLUS - (int) h;
+            mlv_play_osd_y = MIN(mlv_play_osd_y + border, y_bottom + 1);
+            if(mlv_play_osd_y > y_bottom)
             {
                 mlv_play_osd_state = MLV_PLAY_MENU_HIDDEN;
+                osd_line[0] = 0;
+                return 0;
             }
             redraw = 1;
             break;
@@ -1447,6 +1475,11 @@ static void check_dup_frame(frame_buf_t *buffer)
 
 static void mlv_play_render_frame(frame_buf_t *buffer)
 {
+    if (buffer->skip)
+    {
+        return;
+    }
+    raw_set_layout(buffer->layout);
     raw_info.buffer = buffer->frameBufferAligned;
     raw_info.bits_per_pixel = buffer->bitDepth;
     raw_info.black_level = buffer->blackLevel;
@@ -1713,6 +1746,9 @@ static void mlv_play_mlv(char *filename, FILE **chunk_files, uint32_t chunk_coun
 
     void *mlv_play_decomp_buf = NULL;
     struct memSuite *mlv_play_decomp_suite = NULL;
+    /* CRX: sample header size (0x70 lossless, 0x220 C-RAW), which the
+     * frames are read for: the first subband after it must be aligned */
+    int crx_hdr = 0x70;
 
     /* read footer information and update global variables, will seek automatically */
     if(chunk_count < 1 || !mlv_play_is_mlv(chunk_files[0]))
@@ -1949,16 +1985,18 @@ static void mlv_play_mlv(char *filename, FILE **chunk_files, uint32_t chunk_coun
             int32_t read_size = MIN(frame_size, vidf_block.blockSize - (sizeof(mlv_vidf_hdr_t) + vidf_block.frameSpace));
             void *read_buffer = buffer->frameBufferAligned;
             
-            /* when we have LJ92 compressed video, read into a different buffer, decompressor will store it in the other one */
-            if(main_header.videoClass & MLV_VIDEO_CLASS_FLAG_LJ92)
+            /* when we have LJ92 or CRX compressed video, read into a different buffer, decompressor will store it in the other one */
+            if(main_header.videoClass & (MLV_VIDEO_CLASS_FLAG_LJ92 | MLV_VIDEO_CLASS_FLAG_CRX))
             {
                 /* none allocated yet? do so */
                 if(!mlv_play_decomp_buf)
                 {
                     int mem_size = (buffer->frameSize + 0x1000) & ~0xFFF;
                     
-                    /* keep in mind the address must be aligned, alloc a few k more */
-                    mlv_play_decomp_buf = fio_malloc(mem_size + 0x1000);
+                    /* keep in mind the address must be aligned, alloc a few k more
+                     * (CRX: 256 bytes for alignment and up to 5 kB of subband
+                     * padding after the sample) */
+                    mlv_play_decomp_buf = fio_malloc(mem_size + 0x2000);
                     if(!mlv_play_decomp_buf)
                     {
                         bmp_printf(FONT_MED, 20, 100, "failed to alloc mlv_play_decomp_buf");
@@ -1975,8 +2013,15 @@ static void mlv_play_mlv(char *filename, FILE **chunk_files, uint32_t chunk_coun
                     }
                 }
                 
-                /* reading into this one */
-                read_buffer = mlv_play_decomp_buf;
+                /* reading into this one; the CRX decoder's DMA ignores the
+                 * low address bits, so the sample must start aligned (the
+                 * allocation has spare room for this) */
+                read_buffer = (void *)(((uintptr_t) mlv_play_decomp_buf + 127) & ~127);
+                if (main_header.videoClass & MLV_VIDEO_CLASS_FLAG_CRX)
+                {
+                    /* the subbands start after the header: put that on a 128-byte boundary */
+                    read_buffer = (uint8_t *) read_buffer + ((-crx_hdr) & 127);
+                }
             }
             
             /* safety check to make sure the format matches, but allow the saved block to be larger (some dummy data at the end of frame is allowed) */
@@ -2006,8 +2051,68 @@ static void mlv_play_mlv(char *filename, FILE **chunk_files, uint32_t chunk_coun
             buffer->bitDepth = rawi_block.raw_info.bits_per_pixel;
             buffer->blackLevel = rawi_block.raw_info.black_level;
             buffer->whiteLevel = rawi_block.raw_info.white_level;
+            buffer->layout = RAW_LAYOUT_ML;
+            buffer->skip = 0;
 
-            if(main_header.videoClass & MLV_VIDEO_CLASS_FLAG_LJ92)
+            if(main_header.videoClass & MLV_VIDEO_CLASS_FLAG_CRX)
+            {
+                /* one CRX sample per frame: header (tile, plane and subband
+                 * headers, 12 bytes each, padded to 8: 112 bytes lossless,
+                 * 544 for C-RAW's 3 DWT levels; total plane size at +4, big
+                 * endian) + planes, maybe slot padding */
+                const uint8_t *h = read_buffer;
+                int hdr = 0, subbands = 0;
+                if (read_size >= 12 && h[0] == 0xFF && h[1] == 0x01)
+                {
+                    hdr = 12;
+                    while (hdr + 12 <= read_size && h[hdr] == 0xFF && (h[hdr + 1] == 0x02 || h[hdr + 1] == 0x03))
+                    {
+                        subbands += h[hdr + 1] == 0x03;
+                        hdr += 12;
+                    }
+                    hdr = (hdr + 7) & ~7;
+                }
+                int sample_size = hdr ? hdr + (h[4] << 24 | h[5] << 16 | h[6] << 8 | h[7]) : 0;
+                int lossy = subbands > 4;
+                int r = 0;
+                if (main_header.videoClass & MLV_VIDEO_CLASS_FLAG_CRX_FULL)
+                {
+                    /* 1:1 takes: tiles side by side, Canon's full-raw encoder
+                     * setup; crx_dec_frame decodes single-tile samples only */
+                    r = -8;
+                }
+                else if (hdr && hdr != crx_hdr)
+                {
+                    /* a C-RAW clip's first frame (read for a lossless header):
+                     * read it again where its subbands are aligned */
+                    crx_hdr = hdr;
+                    uint8_t *again = (uint8_t *)(((uintptr_t) mlv_play_decomp_buf + 127) & ~127) + ((-crx_hdr) & 127);
+                    FIO_SeekSkipFile(in_file, position + sizeof(mlv_vidf_hdr_t) + vidf_block.frameSpace, SEEK_SET);
+                    if (FIO_ReadFile(in_file, again, read_size) == read_size)
+                    {
+                        read_buffer = again;
+                    }
+                    else
+                    {
+                        r = -2;
+                    }
+                }
+                if (!r)
+                {
+                    r = (sample_size > hdr && sample_size <= read_size)
+                        ? crx_dec_frame(read_buffer, sample_size, buffer->frameBufferAligned,
+                                        rawi_block.xRes, rawi_block.yRes, rawi_block.raw_info.bits_per_pixel, rawi_block.xRes)
+                        : -2;
+                }
+                if (r)
+                {
+                    /* empty frame (a skipped encode) or no decoder */
+                    buffer->skip = 1;
+                    bmp_printf(FONT_MED, 20, 300, r == -1 ? "(CRX: no decoder on this model)" : r == -4 ? "(CRX: decoder memory full)   " : r == -5 ? "(CRX: buffer not aligned)    " : r == -3 ? (lossy ? "(CRX C-RAW: decode error)    " : "(CRX: decode error)          ") : r == -8 ? "(CRX 1:1: no playback yet)   " : "(CRX decode error %d)   ", r);
+                }
+                buffer->layout = RAW_LAYOUT_LSB;
+            }
+            else if(main_header.videoClass & MLV_VIDEO_CLASS_FLAG_LJ92)
             {
                 int output_bpp = raw_twk_available() ? 16 : 14;
                 int r = lossless_decompress_raw(
@@ -2440,9 +2545,10 @@ static void mlv_playlist_build(uint32_t priv)
     /* clear the playlist */
     mlv_playlist_free();
     
-    /* set up initial directories to scan. try to not recurse, but use scan and result queues */
-    msg_queue_post(mlv_playlist_scan_queue, (uint32_t) strdup("A:/"));
-    msg_queue_post(mlv_playlist_scan_queue, (uint32_t) strdup("B:/"));
+    /* set up initial directories to scan. try to not recurse, but use scan and result queues;
+     * only DCIM, where takes are recorded: elsewhere (ML/LOGS) .RAW files are debug dumps */
+    msg_queue_post(mlv_playlist_scan_queue, (uint32_t) strdup("A:/DCIM/"));
+    msg_queue_post(mlv_playlist_scan_queue, (uint32_t) strdup("B:/DCIM/"));
     
     char *directory = NULL;
     while(!msg_queue_receive(mlv_playlist_scan_queue, &directory, 50))
@@ -2597,6 +2703,7 @@ static void mlv_play_task(void *priv)
     int old_black_level = raw_info.black_level;
     int old_white_level = raw_info.white_level;
     int old_bits_per_pixel = raw_info.bits_per_pixel;
+    int old_layout = raw_get_layout();
     
     if (take_semaphore(mlv_play_sem, 100))
     {
@@ -2719,6 +2826,8 @@ cleanup:
     raw_info.black_level = old_black_level;
     raw_info.white_level = old_white_level;
     raw_info.bits_per_pixel = old_bits_per_pixel;
+    raw_set_layout(old_layout);
+    crx_dec_done();
 }
 
 

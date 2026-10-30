@@ -4314,7 +4314,7 @@ abort:
         {
             main_header.videoClass &= ~MLV_VIDEO_CLASS_FLAG_DELTA;
         }
-        
+
         if(no_audio)
         {
             main_header.audioClass = 0x0;

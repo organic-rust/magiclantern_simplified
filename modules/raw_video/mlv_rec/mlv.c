@@ -63,6 +63,11 @@ void mlv_fill_lens(mlv_lens_hdr_t *hdr, uint64_t start_timestamp)
 /*
 - all known information about the current white balance status
 */
+/* applied exposure / WB from the camera, where the core knows them (M6II) */
+extern WEAK_FUNC(ret_0) int lens_get_applied_shutter_us(void);
+extern WEAK_FUNC(ret_0) int lens_get_applied_iso(void);
+extern WEAK_FUNC(ret_0) int lens_get_applied_wb(int *kelvin, int *gain_r, int *gain_g, int *gain_b);
+
 void mlv_fill_wbal(mlv_wbal_hdr_t *hdr, uint64_t start_timestamp)
 {
     /* prepare header */
@@ -77,6 +82,21 @@ void mlv_fill_wbal(mlv_wbal_hdr_t *hdr, uint64_t start_timestamp)
     hdr->wbgain_b = lens_info.WBGain_B;
     hdr->wbs_gm = lens_info.wbs_gm;
     hdr->wbs_ba = lens_info.wbs_ba;
+
+    /* what the camera applies (any WB mode, auto included): gains as
+     * 1/canon_gain (dcraw convention, 1024 = 1.0), and its colour
+     * temperature, which readers use for auto WB */
+    int kelvin, gr, gg, gb;
+    if (lens_get_applied_wb(&kelvin, &gr, &gg, &gb))
+    {
+        hdr->wbgain_r = 1024 * gg / gr;
+        hdr->wbgain_g = 1024;
+        hdr->wbgain_b = 1024 * gg / gb;
+        if (hdr->wb_mode != WB_KELVIN && kelvin > 1000 && kelvin < 20000)
+        {
+            hdr->kelvin = kelvin;
+        }
+    }
 }
 
 void mlv_fill_styl(mlv_styl_hdr_t *hdr, uint64_t start_timestamp)
@@ -116,6 +136,34 @@ void mlv_fill_expo(mlv_expo_hdr_t *hdr, uint64_t start_timestamp)
     hdr->isoAnalog = lens_info.iso_analog_raw;
     hdr->digitalGain = lens_info.iso_digital_ev;
     hdr->shutterValue = (uint32_t)(1000.0f * (1000000.0f / (float)get_current_shutter_reciprocal_x1000()));
+
+    /* exact values Canon's AE applies, where known: the ISO auto ISO
+     * picked, and the exposure time from Tv (not the UI's rounded speed) */
+    int iso = lens_get_applied_iso();
+    if (iso && hdr->isoMode)
+    {
+        hdr->isoValue = iso;
+        /* auto ISO: split the applied ISO into the analog part (what raw
+         * records) and Canon's digital gain, in raw ISO units (1/8 EV,
+         * 72 = ISO 100) as split_iso does for set ISOs */
+        float x = iso / 100.0f;
+        int raw = 72;
+        while (x > 1.0442738f)      /* 2^(1/16): round to the nearest 1/8 EV */
+        {
+            x /= 1.0905077f;        /* 2^(1/8) */
+            raw++;
+        }
+        unsigned analog;
+        int digital;
+        split_iso(raw, &analog, &digital);
+        hdr->isoAnalog = analog;
+        hdr->digitalGain = digital;
+    }
+    int shutter_us = lens_get_applied_shutter_us();
+    if (shutter_us)
+    {
+        hdr->shutterValue = shutter_us;
+    }
 }
 
 void mlv_fill_rtci(mlv_rtci_hdr_t *hdr, uint64_t start_timestamp)

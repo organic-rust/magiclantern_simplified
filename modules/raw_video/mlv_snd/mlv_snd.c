@@ -35,6 +35,7 @@
 #include "../../trace/trace.h"
 #include "../mlv_rec/mlv.h"
 #include "../mlv_rec/mlv_rec_interface.h"
+#include "../rate_fit.h"
 
 /* allocate that many frame slots to be used for WAVI blocks. two is the minimum to maintain operation */
 #define MLV_SND_SLOTS              2
@@ -50,21 +51,49 @@ static CONFIG_INT("mlv.snd.sample.rate", mlv_snd_in_sample_rate, 48000);
 static CONFIG_INT("mlv.snd.sample.rate.selection", mlv_snd_rate_sel, 0);
 static CONFIG_INT("mlv.snd.vsync_delay", mlv_snd_vsync_delay, 1);
 
-extern int StartASIFDMAADC(void *, uint32_t, void *, uint32_t, void (*)(), uint32_t);
-extern int SetNextASIFADCBuffer(void *, uint32_t);
+extern WEAK_FUNC(ret_0) int StartASIFDMAADC(void *, uint32_t, void *, uint32_t, void (*)(), uint32_t);
+extern WEAK_FUNC(ret_0) int SetNextASIFADCBuffer(void *, uint32_t);
 extern WEAK_FUNC(ret_0) int PowerAudioOutput();
 extern WEAK_FUNC(ret_0) void audio_configure(int);
 extern WEAK_FUNC(ret_0) int SetAudioVolumeOut(uint32_t);
 extern WEAK_FUNC(ret_0) int SoundDevActiveIn(uint32_t);
 extern WEAK_FUNC(ret_0) int SoundDevShutDownIn();
 extern WEAK_FUNC(ret_0) int StopASIFDMAADC();
-extern void SetSamplingRate(int sample_rate, int channels);
+/* weak: DIGIC 8 uses Canon's sound input instead (mlv_snd_d8_*) */
+extern WEAK_FUNC(ret_0) void SetSamplingRate(int sample_rate, int channels);
 extern uint64_t get_us_clock();
+
+/* DIGIC 8 (M6II): Canon's sound input with its own ring buffer; the
+ * completion callback reports each new 0.5 s chunk (info words 53/54 =
+ * address / size, 55/56 = the part wrapped to the ring start) */
+struct sound_in_params
+{
+    uint32_t unk0;
+    void    *stream;            /* 0: Canon's default ring (5 s), written back */
+    uint32_t stream_size;
+    uint32_t rate;
+    uint32_t bits;
+    uint32_t channels;
+    void   (*complete_cbr)(void *ctx, uint32_t *info);
+    void   (*stop_cbr)(void *ctx, void *info);
+    void    *ctx;
+};
+extern WEAK_FUNC(ret_0) int SoundDevInOpen(struct sound_in_params *params);
+extern WEAK_FUNC(ret_0) void SoundDevInStart();
+extern WEAK_FUNC(ret_0) void SoundDevInStop();
+extern WEAK_FUNC(ret_0) void SoundDevInClose();
+#define D8_INFO_ADDR1 53
+#define D8_INFO_SIZE1 54
+#define D8_INFO_ADDR2 55
+#define D8_INFO_SIZE2 56
 
 extern void mlv_rec_get_slot_info(int32_t slot, uint32_t *size, void **address);
 extern int32_t mlv_rec_get_free_slot();
 extern void mlv_rec_release_slot(int32_t slot, uint32_t write);
 extern void mlv_rec_set_rel_timestamp(mlv_hdr_t *hdr, uint64_t timestamp);
+/* mlv_lite: the take's measured audio clock (mHz), for its frame rate
+ * metadata; weak, as mlv_rec doesn't have it */
+extern WEAK_FUNC(ret_0) void mlv_rec_set_audio_rate(int nominal_hz, int measured_mhz, int err_ppm);
 extern void mlv_rec_skip_frames(uint32_t count);
 
 static struct msg_queue * volatile mlv_snd_buffers_empty = NULL;
@@ -111,6 +140,15 @@ audio_data_t *mlv_snd_next_buffer = NULL;
 #define MLV_SND_STATE_SOUND_STOPPED          6  /* all threads and stuff is stopped, finish cleanup, set by task */
 
 static uint32_t mlv_snd_state = MLV_SND_STATE_IDLE;
+
+/* DIGIC 8 sound input state */
+static int mlv_snd_d8 = 0;
+static struct sound_in_params mlv_snd_d8_params;
+static struct semaphore *mlv_snd_d8_stop_sem = NULL;
+static uint64_t mlv_snd_d8_start = 0;
+static volatile uint32_t mlv_snd_d8_dropped = 0;
+static int mlv_snd_d8_open = 0;     /* Canon's input is open */
+static int mlv_snd_d8_failed = 0;   /* didn't open: don't retry every frame */
 
 /* this tells the audio backend that we are going to record sound */
 static ml_cbr_action mlv_snd_snd_rec_cbr (const char *event, void *data)
@@ -191,6 +229,132 @@ static void mlv_snd_asif_in_cbr()
     }
 }
 
+/* DIGIC 8: runs in Canon's sound task, every 0.5 s: copy the new chunk
+ * into the next empty AUDF block and pass it to the writer */
+/* the audio clock measured against get_us_clock (as the video frames are
+ * timestamped): each complete chunk's arrival time against the samples
+ * delivered so far, dropped chunks included (Canon delivered them).  The
+ * AUDF timestamps themselves come from the sample count, so the files
+ * can't show it; mlv_lite asks for it at the end of a take. */
+static struct rate_fit mlv_snd_afit;
+static uint64_t mlv_snd_afit_samples = 0;
+
+/* measured sample rate of the last / current take in mHz, 0 if unknown */
+int mlv_snd_measured_rate_mhz(void)
+{
+    double r = rate_fit_rate(&mlv_snd_afit);
+    return r > 0 ? (int) (r * (double) 1000 + (double) 0.5) : 0;
+}
+
+static void mlv_snd_d8_cbr(void *ctx, uint32_t *info)
+{
+    /* STOPPING too: Canon delivers the last, partial chunk after the
+     * stop request (lost before: clips ended ~0.4 s early) */
+    if (mlv_snd_state != MLV_SND_STATE_SOUND_RUNNING && mlv_snd_state != MLV_SND_STATE_SOUND_STOPPING)
+    {
+        return;
+    }
+    if (!info[D8_INFO_SIZE1] && !info[D8_INFO_SIZE2])
+    {
+        return;
+    }
+
+    /* arrival time first (before the copy); only whole chunks */
+    {
+        uint64_t now = get_us_clock();
+        uint32_t frame_bytes = (mlv_snd_in_bits_per_sample / 8) * mlv_snd_in_channels;
+        uint32_t chunk_bytes = info[D8_INFO_SIZE1] + info[D8_INFO_SIZE2];
+        if (frame_bytes)
+        {
+            mlv_snd_afit_samples += chunk_bytes / frame_bytes;
+            if (mlv_snd_state == MLV_SND_STATE_SOUND_RUNNING)
+            {
+                rate_fit_add(&mlv_snd_afit, mlv_snd_afit_samples, now);
+            }
+        }
+    }
+
+    uint32_t count = 0;
+    audio_data_t *entry = NULL;
+    if (msg_queue_count(mlv_snd_buffers_empty, &count) || count < 1 ||
+        msg_queue_receive(mlv_snd_buffers_empty, &entry, 0) || !entry)
+    {
+        /* don't wait in Canon's task: this chunk is lost */
+        mlv_snd_d8_dropped++;
+        trace_write(trace_ctx, "mlv_snd_d8_cbr: no free buffer, %d chunks dropped", mlv_snd_d8_dropped);
+        return;
+    }
+
+    uint32_t len1 = MIN(info[D8_INFO_SIZE1], entry->length);
+    uint32_t len2 = MIN(info[D8_INFO_SIZE2], entry->length - len1);
+    memcpy(entry->data, (void *) info[D8_INFO_ADDR1], len1);
+    if (len2)
+    {
+        memcpy((uint8_t *) entry->data + len1, (void *) info[D8_INFO_ADDR2], len2);
+    }
+    if (len1 + len2 < entry->length)
+    {
+        /* short last chunk: pad with silence */
+        memset((uint8_t *) entry->data + len1 + len2, 0, entry->length - len1 - len2);
+    }
+
+    /* time from the sample count: each block is entry->length bytes */
+    entry->frameNumber = mlv_snd_frame_number;
+    entry->timestamp = mlv_snd_d8_start + (uint64_t) mlv_snd_frame_number * entry->length * 1000000ULL
+        / (mlv_snd_in_sample_rate * (mlv_snd_in_bits_per_sample / 8) * mlv_snd_in_channels);
+    mlv_snd_frame_number++;
+    msg_queue_post(mlv_snd_buffers_done, (uint32_t) entry);
+}
+
+static void mlv_snd_d8_stop_cbr(void *ctx, void *info)
+{
+    give_semaphore(mlv_snd_d8_stop_sem);
+}
+
+static int mlv_snd_d8_start_input()
+{
+    memset(&mlv_snd_d8_params, 0, sizeof(mlv_snd_d8_params));
+    mlv_snd_d8_params.rate = mlv_snd_in_sample_rate;
+    mlv_snd_d8_params.bits = mlv_snd_in_bits_per_sample;
+    mlv_snd_d8_params.channels = mlv_snd_in_channels;
+    mlv_snd_d8_params.complete_cbr = mlv_snd_d8_cbr;
+    mlv_snd_d8_params.stop_cbr = mlv_snd_d8_stop_cbr;
+    mlv_snd_d8_params.ctx = &mlv_snd_d8_params;
+
+    if (SoundDevInOpen(&mlv_snd_d8_params) || !mlv_snd_d8_params.stream)
+    {
+        /* also what a camera without the stubs returns */
+        trace_write(trace_ctx, "mlv_snd_d8_start_input: open failed");
+        return 0;
+    }
+    mlv_snd_d8_open = 1;
+    mlv_snd_d8_dropped = 0;
+    rate_fit_reset(&mlv_snd_afit);
+    mlv_snd_afit_samples = 0;
+    mlv_snd_d8_start = get_us_clock();
+    SoundDevInStart();
+    return 1;
+}
+
+static void mlv_snd_d8_stop_input()
+{
+    if (!mlv_snd_d8_open)
+    {
+        return;
+    }
+    mlv_snd_d8_open = 0;
+    SoundDevInStop();
+    if (take_semaphore(mlv_snd_d8_stop_sem, 5000))
+    {
+        trace_write(trace_ctx, "mlv_snd_d8_stop_input: no stop callback in 5 s");
+    }
+    SoundDevInClose();
+    if (mlv_snd_d8_dropped)
+    {
+        printf("mlv_snd: %d audio chunks (0.5 s) dropped\n", mlv_snd_d8_dropped);
+    }
+}
+
 static void mlv_snd_flush_entries(struct msg_queue *queue, uint32_t clear)
 {
     uint32_t msgs = 0;
@@ -243,6 +407,29 @@ static void mlv_snd_stop()
     trace_write(trace_ctx, "mlv_snd_stop: stopping worker and audio");
     
     mlv_snd_state = MLV_SND_STATE_SOUND_STOPPING;
+
+    if (mlv_snd_d8)
+    {
+        /* Canon doesn't hand over the partial chunk when its input stops
+         * (M6II clips ended 170-210 ms before the last frame), so keep
+         * it running until a whole chunk covers the stop moment: the
+         * audio then runs past the video by up to one chunk (0.5 s) */
+        uint64_t stop_us = get_us_clock();
+        uint64_t bytes_per_s = mlv_snd_in_sample_rate * (mlv_snd_in_bits_per_sample / 8) * mlv_snd_in_channels;
+        for (int i = 0; i < 40; i++)
+        {
+            uint64_t covered = mlv_snd_d8_start + (uint64_t) mlv_snd_frame_number * mlv_snd_in_buffer_size * 1000000ULL / bytes_per_s;
+            if (covered >= stop_us || !mlv_snd_d8_open)
+            {
+                break;
+            }
+            msleep(20);
+        }
+
+        /* no ASIF buffer chain to run out: stop Canon's input, then the writer */
+        mlv_snd_d8_stop_input();
+        mlv_snd_state = MLV_SND_STATE_SOUND_STOP_TASK;
+    }
     
     /* wait until audio and task stopped */
     uint32_t loops = 100;
@@ -258,10 +445,13 @@ static void mlv_snd_stop()
         beep();
     }
     
-    /* some models may need this */
-    StopASIFDMAADC();
-    // SoundDevShutDownIn();  /* no model seems to need this */
-    audio_configure(1);
+    if (!mlv_snd_d8)
+    {
+        /* some models may need this */
+        StopASIFDMAADC();
+        // SoundDevShutDownIn();  /* no model seems to need this */
+        audio_configure(1);
+    }
     
     /* now flush the buffers */
     trace_write(trace_ctx, "mlv_snd_stop: flush mlv_snd_buffers_done");
@@ -343,6 +533,16 @@ static void mlv_snd_prepare_audio()
 {
     mlv_snd_in_sample_rate = mlv_snd_rates[mlv_snd_rate_sel];
 
+    if (mlv_snd_d8)
+    {
+        /* Canon's input sets itself up; tested at 48 kHz 16-bit stereo
+         * only. No ASIF registers here (0xC092011C is a DIGIC 4/5 one) */
+        mlv_snd_in_sample_rate = 48000;
+        mlv_snd_in_bits_per_sample = 16;
+        mlv_snd_in_channels = 2;
+        return;
+    }
+
     /* some models may need this */
     SoundDevActiveIn(0);
     
@@ -355,8 +555,8 @@ static void mlv_snd_prepare_audio()
 
 static void mlv_snd_alloc_buffers()
 {
-    /* calculate buffer size */
-    int fps = 5;
+    /* calculate buffer size; DIGIC 8: Canon's chunks are 0.5 s */
+    int fps = mlv_snd_d8 ? 2 : 5;
 
     mlv_snd_in_buffer_size = (mlv_snd_in_sample_rate * (mlv_snd_in_bits_per_sample / 8) * mlv_snd_in_channels) / fps;
     trace_write(trace_ctx, "mlv_snd_alloc_buffers: mlv_snd_in_buffer_size = %d", mlv_snd_in_buffer_size);
@@ -415,12 +615,17 @@ static void mlv_snd_writer(int unused)
                 hdr->frameNumber = buffer->frameNumber;
                 mlv_rec_set_rel_timestamp((mlv_hdr_t*)hdr, buffer->timestamp);
                 
+                /* counted for the header now: a slot that isn't full at the
+                 * stop is written by the flush, which only counts entries
+                 * still waiting (DIGIC 8's 0.5 s chunks: a short take never
+                 * fills one, and the header said 0 audio frames) */
+                mlv_snd_frames_queued = MAX(mlv_snd_frames_queued, hdr->frameNumber + 1);
+
                 /* only queue for writing if the whole mlv_rec slot was filled */
                 if(buffer->mlv_slot_end)
                 {
                     trace_write(trace_ctx, "   --> WRITER: entry is MLV slot %d (last buffer, so release)", buffer->mlv_slot_id);
                     mlv_rec_release_slot(buffer->mlv_slot_id, 1);
-                    mlv_snd_frames_queued = hdr->frameNumber + 1;
                     mlv_snd_queue_slot();
                 }
                 free(buffer);
@@ -503,6 +708,7 @@ static void mlv_snd_cbr_starting(uint32_t event, void *ctx, mlv_hdr_t *hdr)
     mlv_snd_alloc_buffers();
     
     /* reset all variables first */
+    mlv_snd_d8_failed = 0;
     mlv_snd_file_num = UINT16_MAX;
     mlv_snd_frame_number = 0;
     mlv_snd_frames_queued = 0;
@@ -516,7 +722,7 @@ static void mlv_snd_cbr_starting(uint32_t event, void *ctx, mlv_hdr_t *hdr)
 static void mlv_snd_cbr_started(uint32_t event, void *ctx, mlv_hdr_t *hdr)
 {
     /* the first time we get called from vsync, start recording */
-    if(mlv_snd_state != MLV_SND_STATE_READY)
+    if(mlv_snd_state != MLV_SND_STATE_READY || mlv_snd_d8_failed)
     {
         return;
     }
@@ -537,6 +743,25 @@ static void mlv_snd_cbr_started(uint32_t event, void *ctx, mlv_hdr_t *hdr)
     }
     
     trace_write(trace_ctx, "mlv_snd_cbr_started: starting audio");
+
+    if (mlv_snd_d8)
+    {
+        /* Canon's input has its own ring; its callback takes blocks from
+         * the queue in order as chunks come in. Don't take any here:
+         * putting them back (as before) moved the first slot's first two
+         * blocks behind the second slot - by then slot 1 was written and
+         * handed back, and 1 s of sound was lost */
+        mlv_snd_state = MLV_SND_STATE_SOUND_RUNNING;
+        if (!mlv_snd_d8_start_input())
+        {
+            /* stay READY (the stop path cleans up), but don't retry */
+            mlv_snd_d8_failed = 1;
+            mlv_snd_state = MLV_SND_STATE_READY;
+            bmp_printf(FONT(FONT_MED, COLOR_RED, COLOR_BLACK), 10, 130, "audio: sound input didn't open");
+            beep();
+        }
+        return;
+    }
     
     /* get two buffers and queue them to ASIF */
     mlv_snd_current_buffer = NULL;
@@ -573,6 +798,8 @@ static void mlv_snd_cbr_stopping(uint32_t event, void *ctx, mlv_hdr_t *hdr)
     trace_write(trace_ctx, "mlv_snd_cbr_stopping: stopping");
     mlv_snd_stop();
 
+    /* all chunks are in now */
+    mlv_rec_set_audio_rate(mlv_snd_in_sample_rate, mlv_snd_measured_rate_mhz(), rate_fit_err_ppm(&mlv_snd_afit));
     mlv_snd_state = MLV_SND_STATE_IDLE;
 }
 
@@ -701,6 +928,10 @@ static unsigned int mlv_snd_init()
     //    trace_format(trace_ctx, TRACE_FMT_TIME_REL | TRACE_FMT_COMMENT, ' ');
     //}
     
+    /* DIGIC 8: Canon's sound input instead of ASIF DMA (M6II stubs) */
+    mlv_snd_d8 = (get_digic_version() >= 8);
+    mlv_snd_d8_stop_sem = create_named_semaphore("mlv_snd_d8_stop", 0);
+
     trace_write(trace_ctx, "mlv_snd_init: init queues");
     mlv_snd_buffers_empty = (struct msg_queue *) msg_queue_create("mlv_snd_buffers_empty", MLV_SND_BLOCKS_PER_SLOT * MLV_SND_SLOTS);
     mlv_snd_buffers_done = (struct msg_queue *) msg_queue_create("mlv_snd_buffers_done", MLV_SND_BLOCKS_PER_SLOT * MLV_SND_SLOTS);

@@ -30,6 +30,26 @@
 #define MLV_VIDEO_CLASS_FLAG_LZMA    0x80
 #define MLV_VIDEO_CLASS_FLAG_DELTA   0x40
 #define MLV_VIDEO_CLASS_FLAG_LJ92    0x20
+/* 0x200 was PACK_LSB (early M6II takes in the DIGIC 8 LSB-first bit
+ * order); no longer written or read.  0x10 is taken by MLV App (JPEG2K),
+ * 0x100 by its internal MCRAW marker. */
+/* Each frame is one CRX sample (Canon's CR3 raw codec): tile, plane and
+ * subband headers and 4 plane bitstreams, as in a CR3 track.  mlv_lite's
+ * own encodes: one tile, cfaLayout 1; lossless (encType 0, 0 DWT levels)
+ * or C-RAW (Canon's single-tile encoder 3, 3 DWT levels; the sample
+ * header says which).  RAWI gives width
+ * (res_x), height (res_y) and bits; decoders rebuild the CMP1 parameters
+ * from those. */
+#define MLV_VIDEO_CLASS_FLAG_CRX     0x400
+/* With FLAG_CRX: the frames come from Canon's full-raw encoder setup (M6II
+ * 1:1 takes, the RAW burst's C-RAW job): Canon's CR3 sample in equal
+ * tiles side by side (count them from the tile headers), decorrelated
+ * planes (CMP1 encType 3), RGGB plane order (cfaLayout 0). */
+#define MLV_VIDEO_CLASS_FLAG_CRX_FULL 0x800
+/* With FLAG_CRX_FULL: Canon's full-raw *lossless* encoder (its RAW stills'
+ * job type 0 / encoder 0; mlv_lite 1:1 lossless takes): equal tiles side by
+ * side, cfaLayout 0 as FULL, but encType 0 and 0 DWT levels */
+#define MLV_VIDEO_CLASS_FLAG_CRX_ENC0 0x1000
 
 #define MLV_AUDIO_CLASS_FLAG_LZMA    0x80
 
