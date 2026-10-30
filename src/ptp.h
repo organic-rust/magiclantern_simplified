@@ -125,6 +125,22 @@ struct ptp_handler
  *
  * \internal Typically PTP_HANDLER() is a better choice.
  */
+/* see ptp.c */
+#define PTP_MAILBOX_MAGIC 0x4D4C4D42   /* "BMLM" */
+#define PTP_MAILBOX_SLOTS 8
+struct ptp_mailbox
+{
+	uint32_t magic;
+	struct
+	{
+		void *     ptr;
+		uint32_t * len;     /* points to the current length */
+		char       name[8];
+	} slot[PTP_MAILBOX_SLOTS];
+};
+extern struct ptp_mailbox ptp_mailbox;
+void ptp_mailbox_set(int slot, const char *name, void *ptr, volatile uint32_t *len);
+
 #define REGISTER_PTP_HANDLER( ID, HANDLER, PRIV ) \
 	struct ptp_handler \
 __attribute__((section(".ptp_handlers"))) \

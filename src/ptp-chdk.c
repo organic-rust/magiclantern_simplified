@@ -116,7 +116,8 @@ PTP_HANDLER( PTP_OC_CHDK, 0 )
             {
                 uint32_t pos = 0;
 
-                if ( length == 0 )
+                /* the first page faults on D8 and takes the PTP task down */
+                if ( length == 0 || address < 0x1000 )
                 {
                     msg.id = PTP_RC_GeneralError;
                     break;
@@ -572,6 +573,148 @@ PTP_HANDLER( PTP_OC_CHDK, 0 )
             bmp_printf(FONT_LARGE, 0, 0, "ExecuteScript: not implemented");
             msleep(1000);
             break;
+
+        case PTP_CHDK_ML_FileOp:
+            {
+                /* ML extension, for installing builds over USB: create a
+                 * directory, rename or remove a file (paths via TempData) */
+                if ( temp_data_kind != 1 || temp_data_extra < 1 || temp_data_extra > 200 )
+                {
+                    msg.id = PTP_RC_GeneralError;
+                    break;
+                }
+
+                char paths[202];
+                memcpy(paths, temp_data.str, temp_data_extra);
+                paths[temp_data_extra] = '\0';
+                paths[temp_data_extra + 1] = '\0';
+                fio_free(temp_data.str);
+                temp_data_kind = 0;
+
+                int ret = -1;
+                switch (param2)
+                {
+                    case 1:
+                        ret = FIO_CreateDirectory(paths);
+                        break;
+                    case 2:
+                    {
+                        const char *dst = paths + strlen(paths) + 1;
+                        ret = *dst ? FIO_RenameFile(paths, dst) : -1;
+                        break;
+                    }
+                    case 3:
+                        ret = FIO_RemoveFile(paths);
+                        break;
+                }
+                msg.param_count = 1;
+                msg.param[0] = ret;
+                break;
+            }
+
+        case PTP_CHDK_ML_ReadRange:
+            {
+                if ( temp_data_kind != 1 || temp_data_extra < 1 || temp_data_extra > 100 || param4 > (16 << 20) )
+                {
+                    msg.id = PTP_RC_GeneralError;
+                    break;
+                }
+
+                char fn[101];
+                memcpy(fn, temp_data.str, temp_data_extra);
+                fn[temp_data_extra] = '\0';
+                fio_free(temp_data.str);
+                temp_data_kind = 0;
+
+                FILE *f = FIO_OpenFile(fn, O_RDONLY);
+                if ( f == NULL )
+                {
+                    msg.id = PTP_RC_GeneralError;
+                    break;
+                }
+
+                if ( param4 == 0 )
+                {
+                    /* size: seek to the end (64-bit) */
+                    int64_t size = FIO_SeekSkipFile(f, 0, SEEK_END);
+                    FIO_CloseFile(f);
+                    msg.param_count = 2;
+                    msg.param[0] = (uint32_t) size;
+                    msg.param[1] = (uint32_t) (size >> 32);
+                    break;
+                }
+
+                int64_t offset = ((int64_t) param3 << 32) | param2;
+                char *buf = fio_malloc(param4);
+                if ( buf == NULL || FIO_SeekSkipFile(f, offset, SEEK_SET) != offset )
+                {
+                    FIO_CloseFile(f);
+                    if ( buf ) fio_free(buf);
+                    msg.id = PTP_RC_GeneralError;
+                    break;
+                }
+                int got = FIO_ReadFile(f, buf, param4);
+                FIO_CloseFile(f);
+                if ( got <= 0 || !send_ptp_data(context, buf, got) )
+                {
+                    msg.id = PTP_RC_GeneralError;
+                }
+                fio_free(buf);
+                msg.param_count = 1;
+                msg.param[0] = got;
+                break;
+            }
+
+        case PTP_CHDK_ML_ListDir:
+            {
+                /* ML extension: directory from PTP_CHDK_TempData; returns
+                 * one line per entry, "D|F size timestamp name\n" */
+                if ( temp_data_kind != 1 || temp_data_extra > 100 )
+                {
+                    msg.id = PTP_RC_GeneralError;
+                    break;
+                }
+
+                char dir[101];
+                memcpy(dir, temp_data.str, temp_data_extra);
+                dir[temp_data_extra] = '\0';
+                fio_free(temp_data.str);
+                temp_data_kind = 0;
+
+                const int max = 64 * 1024;
+                char *out = fio_malloc(max);
+                if ( !out )
+                {
+                    msg.id = PTP_RC_GeneralError;
+                    break;
+                }
+
+                int len = 0;
+                struct fio_file file;
+                struct fio_dirent *dirent = FIO_FindFirstEx(dir, &file);
+                if ( !IS_ERROR(dirent) )
+                {
+                    do
+                    {
+                        /* ML's snprintf has no %u or %c */
+                        len += snprintf(out + len, max - len, "%s %d %d %s\n",
+                                        (file.mode & ATTR_DIRECTORY) ? "D" : "F",
+                                        file.size, file.timestamp, file.name);
+                    } while ( len < max - 128 && FIO_FindNextEx(dirent, &file) == 0 );
+                    FIO_FindClose(dirent);
+                }
+
+                if ( !len )
+                {
+                    out[len++] = '\n';     /* no zero-length data phase */
+                }
+                if ( !send_ptp_data(context, out, len) )
+                {
+                    msg.id = PTP_RC_GeneralError;
+                }
+                fio_free(out);
+                break;
+            }
 
         default:
             msg.id = PTP_RC_ParameterNotSupported;
