@@ -57,6 +57,21 @@ enum {
   PTP_CHDK_GDBStub_Download,
                             // param2 is the transfer buffer size
 
+  PTP_CHDK_ML_FileOp = 0x4D4D, // ML extension: param2 = 1 mkdir, 2 rename,
+                            // 3 remove; path(s) from PTP_CHDK_TempData
+                            // (rename: "src" NUL "dst"); return param1 = 0
+                            // on success
+  PTP_CHDK_ML_ListDir = 0x4D4C, // ML extension: directory name from
+                            // PTP_CHDK_TempData; return data is a text
+                            // listing, one "D|F size timestamp name" line
+                            // per entry
+  PTP_CHDK_ML_ReadRange = 0x4D4E, // ML extension: file from
+                            // PTP_CHDK_TempData; param2/3 = 64-bit offset
+                            // (low, high), param4 = length (<= 16 MB).
+                            // Length 0: no data, return params = 64-bit
+                            // file size (low, high). Files over 2/4 GB,
+                            // which DownloadFile and ListDir can't size.
+
 } ptp_chdk_command;
 
 // data types as used by TempData and ExecuteScript
