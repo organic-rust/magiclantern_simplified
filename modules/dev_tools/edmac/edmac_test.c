@@ -21,9 +21,12 @@ static int Log(const char * fmt, ...)
     return len;
 }
 
-extern uint32_t edmac_read_chan;
-extern uint32_t edmac_write_chan;
-extern uint32_t dmaConnection;
+/* from edmac-memcpy.c, which not every model builds (CONFIG_EDMAC_MEMCPY);
+ * weak fallbacks let the module load there, edmac_test() doesn't run */
+__attribute__((weak)) uint32_t edmac_read_chan = 0;
+__attribute__((weak)) uint32_t edmac_write_chan = 0;
+__attribute__((weak)) uint32_t dmaConnection = 0;
+extern WEAK_FUNC(ret_0) uint32_t edmac_find_divider(size_t length, size_t transfer_size);
 
 static void edmac_read_complete_cbr (void* ctx)
 {
