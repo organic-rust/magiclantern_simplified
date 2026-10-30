@@ -19,6 +19,7 @@
 extern void _lv_vsync_signal();
 extern void hdr_step();
 extern void raw_lv_vsync();
+extern void raw_lv_bpp_vsync();
 extern int hdr_kill_flicker();
 extern void digic_zoom_overlay_step(int force_off);
 extern void vignetting_correction_apply_regs();
@@ -91,8 +92,15 @@ static void FAST vsync_func() // called once per frame.. in theory :)
     module_exec_cbr(CBR_VSYNC);
     #endif
     
+    #ifdef CONFIG_FPS_MEASURED_FROM_VSYNC
+    extern void fps_vsync_measure();
+    fps_vsync_measure();
+    #endif
+
     #ifdef CONFIG_EDMAC_RAW_SLURP
     raw_lv_vsync();
+    #elif defined(CONFIG_DIGIC_8X) && defined(CONFIG_RAW_LIVEVIEW)
+    raw_lv_bpp_vsync();
     #endif
 
     #if !defined(CONFIG_EVF_STATE_SYNC)

@@ -117,7 +117,9 @@ struct edmac_mmio
     uint32_t transfer_mode;
     uint32_t unk_06[0x3];
     uint32_t PackUnpackInfo;
-    uint32_t unk_07[0xb]; // some of this is padding, but I don't know how much
+    uint32_t unk_07[0x6];
+    uint32_t current_addr; // 0xEC, read by Canon's get-pointer function (M6II 0xE0581556)
+    uint32_t unk_08[0x4]; // some of this is padding, but I don't know how much
 };
 #else
 // For some more, not terribly clear info on pre-DIGIC8, see:
@@ -167,6 +169,13 @@ uint32_t edmac_get_pointer(uint32_t channel);   /* current address (from hardwar
 uint32_t edmac_get_length(uint32_t channel);    /* yb,xb (hi,lo) */
 uint32_t edmac_get_connection(uint32_t channel, uint32_t direction);
 uint32_t edmac_get_dir(uint32_t channel);
+uint32_t edmac_get_num_channels(void);
+uint32_t edmac_get_pack_reg(uint32_t channel);  /* D8 only, 0 elsewhere */
+
+/* Modules are built without CONFIG_DIGIC_*, so in a module struct edmac_info
+ * and struct edmac_mmio always have the D4/D5 layout.  On D8 cameras the
+ * core's struct edmac_info is larger: modules must not use edmac_get_info()
+ * or anything taking struct edmac_info there. */
 
 /* off1/off2 are signed on some odd number of bits;
  * use this to extend the sign bit to int32 */

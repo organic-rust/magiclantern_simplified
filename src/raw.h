@@ -104,6 +104,18 @@ void raw_set_pixel(int x, int y, int value);
 /* get a pixel from a custom raw buffer (not from the main one) */
 int raw_get_pixel_ex(void* raw_buffer, int x, int y);
 
+/* layout of raw_info.buffer: RAW_LAYOUT_ML or RAW_LAYOUT_LSB (raw_layout.h) */
+int raw_get_layout(void);
+void raw_set_layout(int layout);
+
+/* true if raw_info.buffer can be read as struct raw_pixblock (ML layout,
+ * 14 bit); otherwise use raw_get_pixel() and friends */
+int raw_uses_pixblocks(void);
+
+/* DIGIC 8 Mem1 source: RAW_LAYOUT_LSB (default; Canon's CR3 encoder reads
+ * it) or RAW_LAYOUT_ML (Canon's own setting, readable by any MLV tool) */
+void raw_lv_request_layout(int layout);
+
 /* get a grayscale pixel according to some projection from RGB */
 int raw_get_gray_pixel(int x, int y, int gray_projection);
 #define GRAY_PROJECTION_RED 0
@@ -151,6 +163,14 @@ int raw_lv_enabled();
 /* redirect the LV RAW EDMAC in order to write the raw data at "ptr" */
 void raw_lv_redirect_edmac(void* ptr);
 
+/* 0 if the LV raw channel can't be pointed at another buffer, so
+ * double-buffering by redirecting it would leave every other frame stale */
+int raw_lv_can_redirect(void);
+
+/* M6II Mem1: switch the sensor-head stream to 14/12/10 bit (1 switched,
+ * 0 already, -1 not possible here) */
+int raw_lv_mem1_set_depth(int bits);
+
 /* cut the right part of the LV raw image (makes buffer smaller); may reduce DMA load */
 /* returns the value actually used (or 0 if it doesn't work) */
 int raw_lv_shave_right(int offset);
@@ -170,6 +190,12 @@ int focus_box_get_raw_crop_offset(int* delta_x, int* delta_y); /* this is in sho
 
 /* called from state-object.c */
 void raw_lv_vsync();
+
+/* D8: applies raw_lv_request_bpp, once per LV frame */
+void raw_lv_bpp_vsync();
+
+/* D8: frames where Canon put its own bit depth back since the last request */
+int raw_lv_get_bpp_reverts();
 
 /* called from lv-img-engio.c */
 int _raw_lv_get_iso_post_gain();

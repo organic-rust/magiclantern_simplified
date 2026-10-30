@@ -66,6 +66,7 @@ static int32_t get_tick_count() { return get_ms_clock(); }
 #endif
 
 #include "raw.h"
+#include "raw_layout.h"
 #include "chdk-dng.h"
 
 /* adaptations from CHDK to ML */
@@ -759,7 +760,7 @@ static int32_t write_dng(FILE* fd, struct raw_info * raw_info)
 #ifdef CONFIG_MAGICLANTERN
 PROP_HANDLER(PROP_CAM_MODEL)
 {
-    snprintf(cam_name, sizeof(cam_name), (const char *)buf);
+    snprintf(cam_name, sizeof(cam_name), "%s", prop_cam_model_name(buf, len));
 }
 #endif
 
@@ -777,13 +778,41 @@ int save_dng(char* filename, struct raw_info * raw_info)
     raw_info->jpeg.height = raw_info->height;
     #endif
     
+    #ifdef CONFIG_MAGICLANTERN
+    /* write_dng() expects ML's layout (it byte-swaps that into DNG order).
+     * D8's native layout is converted into a separate buffer, so a live
+     * frame is never modified. */
+    void * converted = 0;
+    struct raw_info ml_layout_info;
+    if (raw_get_layout() == RAW_LAYOUT_LSB)
+    {
+        converted = umalloc(raw_info->frame_size + 4);
+        if (!converted) return 0;
+        for (int y = 0; y < raw_info->height; y++)
+        {
+            raw_layout_convert_row(
+                raw_info->buffer + y * raw_info->pitch, RAW_LAYOUT_LSB,
+                converted + y * raw_info->pitch, RAW_LAYOUT_ML,
+                raw_info->bits_per_pixel, raw_info->width
+            );
+        }
+        ml_layout_info = *raw_info;
+        ml_layout_info.buffer = converted;
+        raw_info = &ml_layout_info;
+    }
+    #endif
+
     FILE* f = FIO_CreateFile(filename);
-    if (!f) return 0;
-    int32_t ok = write_dng(f, raw_info);
-    FIO_CloseFile(f);
+    int32_t ok = f && write_dng(f, raw_info);
+    if (f) FIO_CloseFile(f);
+
+    #ifdef CONFIG_MAGICLANTERN
+    if (converted) ufree(converted);
+    #endif
+
     if (!ok)
     {
-        FIO_RemoveFile(filename);
+        if (f) FIO_RemoveFile(filename);
         return 0;
     }
     return 1;

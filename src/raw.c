@@ -20,6 +20,7 @@
 
 #include "dryos.h"
 #include "raw.h"
+#include "raw_layout.h"
 #include "property.h"
 #include "math.h"
 #include "bmp.h"
@@ -64,6 +65,39 @@ static void raw_set_dirty_with_timeout(int timeout_ms)
 void raw_set_dirty(void)
 {
     dirty = 1;
+}
+
+/* pixel layout of raw_info.buffer, see raw_layout.h */
+static int raw_layout = RAW_LAYOUT_ML;
+
+int raw_get_layout(void)
+{
+    return raw_layout;
+}
+
+/* for code that points raw_info at its own buffer (mlv_play: CRX frames
+ * decoded LSB-first) */
+void raw_set_layout(int layout)
+{
+    raw_layout = layout;
+}
+
+/* the struct raw_pixblock fast paths only apply to ML's layout at 14 bits */
+static inline int raw_is_ml14(void)
+{
+    return raw_layout == RAW_LAYOUT_ML && raw_info.bits_per_pixel == 14;
+}
+
+int raw_uses_pixblocks(void)
+{
+    return raw_is_ml14();
+}
+
+/* ML's levels are 14-bit constants; scale one to the current bit depth */
+static int raw_level_to_bpp(int level14)
+{
+    int bpp = raw_info.bits_per_pixel;
+    return (bpp <= 14) ? level14 >> (14 - bpp) : level14 << (bpp - 14);
 }
 
 /* dual ISO interface */
@@ -138,6 +172,14 @@ static int (*dual_iso_get_dr_improvement)() = MODULE_FUNCTION(dual_iso_get_dr_im
 #ifdef CONFIG_RAW_LIVEVIEW
 // volatile because this points at some OS managed MMIO
 static volatile struct edmac_mmio *raw_lv_edmac = (struct edmac_mmio *)RAW_LV_EDMAC_CHANNEL_ADDR;
+
+// D4/D5 EDMAC registers are read back from the engio shadow (shamem);
+// D8 ones are readable directly, and Canon reads them that way.
+#ifdef CONFIG_DIGIC_8X
+#define raw_lv_edmac_read(field) MEM((uint32_t)&(raw_lv_edmac->field))
+#else
+#define raw_lv_edmac_read(field) shamem_read((uint32_t)&(raw_lv_edmac->field))
+#endif
 #endif
 
 #endif  /* no CONFIG_EDMAC_RAW_SLURP */
@@ -203,7 +245,13 @@ static int lv_raw_gain = 0;
  * one size fits all: 16200 may sacrifice up to 0.02 EV of highlights
  * that is, log2((16382-2048) / (16000-2048))
  */
+#if defined(CONFIG_M6II) && defined(RAW_LV_SOURCE_MEM1)
+/* Mem1 (HEAD tap) clips at 16380 in every channel at ISO 100 and 800:
+ * the 14-bit range, not the sensor (measured on a bright scene) */
+#define WHITE_LEVEL 16380
+#else
 #define WHITE_LEVEL 16200
+#endif
 
 static int get_default_white_level()
 {
@@ -701,15 +749,369 @@ static void * raw_lv_buffer = 0;
 static int raw_lv_buffer_size = 0;
 #endif
 
+#ifdef RAW_LV_SOURCE_MEM1
+/* Canon's Mem1Path packs the sensor head in ML's 16-bit word layout
+ * (pack fields f1 = 1, f3 = 0) at 14 bit; the D8 LSB-first layout is f1 =
+ * 0, f3 = 1, as channel 1 delivers it (and as Canon's CR3 encoder reads
+ * it).  raw_lv_request_layout picks one (LSB-first by default).  Canon
+ * reprograms the channel from these fields every frame, and may reset them
+ * when LiveView starts.  Returns 1 if they had to be changed. */
+static int mem1_layout = RAW_LAYOUT_LSB;
+
+static int raw_lv_mem1_use_layout()
+{
+    volatile uint32_t *f = (volatile uint32_t *)(RAW_LV_MEM1_STATE + RAW_LV_MEM1_PACK_FIELDS);
+    uint32_t f1 = (mem1_layout == RAW_LAYOUT_ML), f3 = !f1;
+    if (f[1] == f1 && f[3] == f3)
+    {
+        return 0;
+    }
+    f[1] = f1;
+    f[3] = f3;
+    return 1;
+}
+
+void raw_lv_request_layout(int layout)
+{
+    mem1_layout = (layout == RAW_LAYOUT_ML) ? RAW_LAYOUT_ML : RAW_LAYOUT_LSB;
+    raw_set_dirty();
+}
+#else
+void raw_lv_request_layout(int layout)
+{
+}
+#endif
+
 /* our default LiveView buffer (which can be DEFAULT_RAW_BUFFER or allocated) */
 static void* raw_get_default_lv_buffer()
 {
 #if !defined(CONFIG_EDMAC_RAW_SLURP)
-    return CACHEABLE(shamem_read((uint32_t)&(raw_lv_edmac->ram_addr)));
+    /* M6II (CONFIG_MEM_2GB): 0x64400000 and 0x24400000 are aliases
+     * (dmlog "Memory alias check", 256/256 words equal), so CACHEABLE()
+     * is right here too */
+    return CACHEABLE(raw_lv_edmac_read(ram_addr));
 #else
     return CACHEABLE(raw_lv_buffer);
 #endif
 }
+#if defined(CONFIG_DIGIC_8X) && !defined(CONFIG_EDMAC_RAW_SLURP)
+/* D8 packs in the EDMAC channel itself: depth code in bits 4-5 of the
+ * channel's pack register (0/1/2 = 10/12/14 bit); bit 0 (f3, LSB-first)
+ * and bit 20 (f1, ML's 16-bit word layout) both clear = not packed (16
+ * bit).  M6II LV: 0xC0000011, 12 bit; Mem1: 0xC0100020 (Canon's, ML layout
+ * 14 bit), 0xC0000021 (LSB-first 14 bit).  Returns 0 if unknown. */
+static int pack_reg_to_bpp(uint32_t pack)
+{
+    if (!(pack & 1) && !(pack & 0x100000))
+    {
+        return 16;
+    }
+    int code = (pack >> 4) & 3;
+    return code < 3 ? 10 + 2 * code : 0;
+}
+#endif
+
+#ifdef RAW_LV_SOURCE_MEM1
+/* Make 8 bytes of patched code visible to both cores' instruction fetch:
+ * clean the data cache line(s) to the point of unification and invalidate
+ * all instruction caches and branch predictors, inner shareable.  Not
+ * sync_caches(): its full clean (and the 0xC1100730 write) hung the
+ * camera when run from the PTP task during LiveView. */
+static void raw_lv_sync_code(uint32_t addr, uint32_t len)
+{
+    for (uint32_t a = addr & ~31; a < addr + len; a += 32)
+    {
+        asm volatile("mcr p15, 0, %0, c7, c11, 1" : : "r"(a));     /* DCCMVAU */
+    }
+    asm volatile("dsb sy" : : : "memory");
+    asm volatile("mcr p15, 0, %0, c7, c1, 0" : : "r"(0));         /* ICIALLUIS */
+    asm volatile("mcr p15, 0, %0, c7, c1, 6" : : "r"(0));         /* BPIALLIS */
+    asm volatile("dsb sy\n isb" : : : "memory");
+}
+
+/* Mem1 at 14, 12 or 10 bit.  Canon's Mem1Path only knows 14 bit: the pack
+ * unit's depth code (f2) is in its state, but the row size it programs
+ * every frame is hard-wired (width * 7 / 4), so we patch that computation
+ * in its RAM copy too.  Both must change between two of its per-frame
+ * set-ups: done from raw_lv_bpp_vsync (Canon's read-out done handling,
+ * ~40 ms before the next set-up).  Not by stopping channel 3 for a few
+ * frames (state +0x40): restarting it in the full 3:2 mode (1592 lines)
+ * caught the last ~240 lines of a frame, and every frame after that
+ * started 240 lines late. */
+static const struct { int bits; uint32_t f2, w1, w2; } mem1_modes[] = {
+    { 14, 2, 0x00C0EBC0, 0x009CF3C0 },  /* rsb r0,r0,r0,lsl #3; ubfx r0,r0,#2,#29: 7w/4 */
+    { 12, 1, 0x0040EB00, 0x005EF3C0 },  /* add r0,r0,r0,lsl #1; ubfx r0,r0,#1,#31: 3w/2 */
+    { 10, 0, 0x0080EB00, 0x009CF3C0 },  /* add r0,r0,r0,lsl #2; ubfx r0,r0,#2,#29: 5w/4 */
+};
+static volatile int mem1_depth_pending = 0;     /* index + 1 */
+
+static void FAST raw_lv_mem1_apply_depth(int i)
+{
+    volatile uint32_t *code = (volatile uint32_t *) RAW_LV_MEM1_XB_CODE;
+    volatile uint32_t *f = (volatile uint32_t *)(RAW_LV_MEM1_STATE + RAW_LV_MEM1_PACK_FIELDS);
+    uint32_t old = cli();
+    f[2] = mem1_modes[i].f2;
+    code[0] = mem1_modes[i].w1;
+    code[1] = mem1_modes[i].w2;
+    raw_lv_sync_code(RAW_LV_MEM1_XB_CODE, 8);
+    sei(old);
+}
+
+/* Returns 1 if switched, 0 if already there, -1 if the code isn't what
+ * we expect. */
+int raw_lv_mem1_set_depth(int bits)
+{
+    volatile uint32_t *code = (volatile uint32_t *) RAW_LV_MEM1_XB_CODE;
+    volatile uint32_t *f = (volatile uint32_t *)(RAW_LV_MEM1_STATE + RAW_LV_MEM1_PACK_FIELDS);
+
+    int want = -1, have = -1;
+    for (int i = 0; i < COUNT(mem1_modes); i++)
+    {
+        if (mem1_modes[i].bits == bits) want = i;
+        if (code[0] == mem1_modes[i].w1 && code[1] == mem1_modes[i].w2) have = i;
+    }
+    if (want < 0 || have < 0)
+    {
+        return -1;
+    }
+    if (want == have && f[2] == mem1_modes[want].f2)
+    {
+        return 0;
+    }
+
+    mem1_depth_pending = want + 1;
+    for (int t = 0; t < 30 && mem1_depth_pending; t++)
+    {
+        msleep(10);
+    }
+    if (mem1_depth_pending)
+    {
+        /* no vsync for 300 ms: LiveView isn't running, no frames to mix */
+        mem1_depth_pending = 0;
+        raw_lv_mem1_apply_depth(want);
+    }
+    raw_set_dirty();
+    return 1;
+}
+#endif
+
+/* bit depth and layout of the LV raw stream */
+static int raw_lv_get_bpp()
+{
+#if defined(CONFIG_DIGIC_8X) && !defined(CONFIG_EDMAC_RAW_SLURP)
+    uint32_t reg = edmac_get_pack_reg(edmac_get_channel(RAW_LV_EDMAC_CHANNEL_ADDR));
+    int bpp = reg ? pack_reg_to_bpp(MEM(reg)) : 0;
+    if (bpp)
+    {
+        return bpp;
+    }
+#endif
+    /* D4/D5: computed as 14 bit, as before */
+    return 14;
+}
+
+static int raw_lv_get_layout()
+{
+#if defined(RAW_LV_SOURCE_MEM1)
+    return mem1_layout;
+#elif defined(CONFIG_DIGIC_8X) && !defined(CONFIG_EDMAC_RAW_SLURP)
+    return RAW_LAYOUT_LSB;
+#else
+    return RAW_LAYOUT_ML;
+#endif
+}
+
+#if defined(CONFIG_DIGIC_8X) && !defined(CONFIG_EDMAC_RAW_SLURP)
+/* LV raw bit depth override.  Canon programs the raw write channel's pack
+ * register and its row size (xb) together (RawPro.c: xb = width * bits / 8),
+ * so we do the same: same pixels per row, fewer bytes.  Applied once per
+ * frame, after Canon's evfReadOutDone handler, so it covers both cases:
+ * Canon setting the channel up once per LV start, or every frame.  The
+ * pack unit drops the low bits (M6II Mem1, 14 -> 12 -> 10 bit: levels / 4
+ * per 2 bits).  Open for channel 1: its 1080p 10-bit rows are 2910 bytes,
+ * not a multiple of 4.  Canon's LV image reads this buffer back (M6II:
+ * ch 48); see raw_lv_reader_bpp() below. */
+static volatile int lv_raw_bpp_request = 0;  /* 0 = Canon's depth */
+static volatile int lv_raw_bpp_canon = 0;    /* Canon's depth, once we changed it */
+static volatile int lv_raw_bpp_reverts = 0;  /* frames where Canon set its own values back */
+static int lv_raw_xb_written = 0;            /* the xb we wrote last, and its width */
+static int lv_raw_width = 0;
+
+#ifdef RAW_LV_READER_EDMAC_CHANNEL_ADDR
+/* Canon's LV display reads the raw buffer back through another channel,
+ * set up once per LV path setup at Canon's depth (M6II: ch 48, 12-bit,
+ * constant in LvDevMvDevControl).  Canon's own 10-bit setup of it (seen
+ * with that constant patched) differs only in the unpack depth and in
+ * these byte counts, all = bpp * pixels / 8; so we scale them like the
+ * writer's xb.  0x88 holds the low half of 0x6C. */
+static const uint16_t lv_rd_offsets[] = { 0x48, 0x50, 0x58, 0x68, 0x6C, 0x74, 0x84 };
+static uint32_t lv_rd_canon[COUNT(lv_rd_offsets)];  /* Canon's values */
+static uint32_t lv_rd_written[COUNT(lv_rd_offsets)]; /* ours, at lv_rd_bpp */
+static int lv_rd_bpp = 0;                             /* 0 = untouched */
+static int lv_rd_canon_bpp = 0;
+
+static int FAST raw_lv_reader_bpp(int target)
+{
+    uint32_t base = RAW_LV_READER_EDMAC_CHANNEL_ADDR;
+    uint32_t reg = edmac_get_pack_reg(edmac_get_channel(base));
+    if (!reg)
+    {
+        return 0;
+    }
+
+    uint32_t cur[COUNT(lv_rd_offsets)];
+    for (int i = 0; i < COUNT(lv_rd_offsets); i++)
+    {
+        cur[i] = MEM(base + lv_rd_offsets[i]);
+    }
+
+    int ours = lv_rd_bpp && !memcmp(cur, lv_rd_written, sizeof(cur));
+    if (!ours)
+    {
+        /* Canon's setup (first time, or Canon reprogrammed the channel) */
+        int bpp = pack_reg_to_bpp(MEM(reg));
+        if (bpp < 10 || bpp > 14)
+        {
+            return 0;
+        }
+        if ((MEM(base + 0x88) & 0xFFFF) != (cur[4] & 0xFFFF))
+        {
+            return 0;   /* not the layout we know */
+        }
+        memcpy(lv_rd_canon, cur, sizeof(cur));
+        lv_rd_canon_bpp = bpp;
+        lv_rd_bpp = bpp;
+    }
+
+    if (target == lv_rd_bpp)
+    {
+        return 1;
+    }
+
+    uint32_t new[COUNT(lv_rd_offsets)];
+    for (int i = 0; i < COUNT(lv_rd_offsets); i++)
+    {
+        uint32_t v = lv_rd_canon[i];
+        /* yb_xb (0x50): xb in the low half */
+        int32_t n = (lv_rd_offsets[i] == 0x50) ? (int32_t)(v & 0xFFFF) : (int32_t) v;
+        if ((n * target) % lv_rd_canon_bpp)
+        {
+            return 0;
+        }
+        n = n * target / lv_rd_canon_bpp;
+        new[i] = (lv_rd_offsets[i] == 0x50) ? ((v & 0xFFFF0000) | (n & 0xFFFF)) : (uint32_t) n;
+    }
+
+    for (int i = 0; i < COUNT(lv_rd_offsets); i++)
+    {
+        MEM(base + lv_rd_offsets[i]) = new[i];
+    }
+    MEM(base + 0x88) = (MEM(base + 0x88) & 0xFFFF0000) | (new[4] & 0xFFFF);
+    MEM(reg) = (MEM(reg) & ~0x30) | (((target - 10) / 2) << 4);
+    memcpy(lv_rd_written, new, sizeof(new));
+    lv_rd_bpp = target;
+    return 1;
+}
+#endif
+
+void FAST raw_lv_bpp_vsync()
+{
+    #ifdef RAW_LV_SOURCE_MEM1
+    int pending = mem1_depth_pending;
+    if (pending)
+    {
+        raw_lv_mem1_apply_depth(pending - 1);
+        mem1_depth_pending = 0;
+    }
+    #endif
+
+    if (!lv_raw_bpp_request && !lv_raw_bpp_canon)
+    {
+        return;
+    }
+
+    uint32_t reg = edmac_get_pack_reg(edmac_get_channel(RAW_LV_EDMAC_CHANNEL_ADDR));
+    if (!reg)
+    {
+        return;
+    }
+    uint32_t pack = MEM(reg);
+    int cur = pack_reg_to_bpp(pack);
+    if (cur < 10 || cur > 14)
+    {
+        return;
+    }
+
+    /* "L" class channels keep xb at +0x5C, see raw_lv_get_resolution */
+    volatile uint32_t * xb_reg = &raw_lv_edmac->yb_xb;
+    int xb = *xb_reg & 0xFFFF;
+    if (!xb)
+    {
+        xb_reg = &raw_lv_edmac->off2s;
+        xb = *xb_reg;
+    }
+    if (!xb)
+    {
+        return;
+    }
+
+    if (!lv_raw_bpp_canon)
+    {
+        lv_raw_bpp_canon = cur;
+    }
+
+    /* an xb we didn't write is Canon's, in Canon's depth (this also
+     * catches LV mode changes); Canon may reset pack and xb separately */
+    int width = (xb == lv_raw_xb_written) ? lv_raw_width : xb * 8 / lv_raw_bpp_canon;
+    int target = lv_raw_bpp_request ? lv_raw_bpp_request : lv_raw_bpp_canon;
+    int new_xb = width * target / 8;
+
+    #ifdef RAW_LV_READER_EDMAC_CHANNEL_ADDR
+    raw_lv_reader_bpp(target);
+    #endif
+
+    if (cur == target && xb == new_xb)
+    {
+        if (!lv_raw_bpp_request)
+        {
+            /* back to Canon's depth: done */
+            lv_raw_bpp_canon = 0;
+            lv_raw_xb_written = 0;
+        }
+        return;
+    }
+
+    if (lv_raw_xb_written && lv_raw_bpp_request)
+    {
+        /* we had set it up, and Canon reprogrammed the channel */
+        lv_raw_bpp_reverts++;
+    }
+
+    if ((width * target) % 8)
+    {
+        return;
+    }
+
+    MEM(reg) = (pack & ~0x30) | (((target - 10) / 2) << 4);
+    if (xb_reg == &raw_lv_edmac->yb_xb)
+    {
+        *xb_reg = (*xb_reg & 0xFFFF0000) | new_xb;
+    }
+    else
+    {
+        *xb_reg = new_xb;
+    }
+    lv_raw_xb_written = new_xb;
+    lv_raw_width = width;
+}
+
+/* number of frames Canon put its own bit depth back since the last request */
+int raw_lv_get_bpp_reverts()
+{
+    return lv_raw_bpp_reverts;
+}
+#endif
+
 /* returns 1 on success */
 static int raw_lv_get_resolution(int* width, int* height)
 {
@@ -775,12 +1177,21 @@ static int raw_lv_get_resolution(int* width, int* height)
 
 #else // ~CONFIG_EDMAC_RAW_SLURP
     /* autodetect raw size from EDMAC */
-    uint32_t lv_raw_height = shamem_read((uint32_t)&(raw_lv_edmac->yn_xn)); // yn_xn??  For height??
-    uint32_t lv_raw_size = shamem_read((uint32_t)&(raw_lv_edmac->yb_xb));
+    uint32_t lv_raw_height = raw_lv_edmac_read(yn_xn); // yn_xn??  For height??
+    uint32_t lv_raw_size = raw_lv_edmac_read(yb_xb);
     if (!lv_raw_size) return 0;
 
     int pitch = lv_raw_size & 0xFFFF;
-    *width = pitch * 8 / 14;
+#ifdef CONFIG_DIGIC_8X
+    /* "L" class channels (M6II channel 1) keep xb at +0x5C (off2s in the
+     * standard layout), and leave the low half of yb_xb at 0.  M6II LV:
+     * xb 2892 bytes x 932 rows, pointer - address = exactly that. */
+    if (!pitch)
+    {
+        pitch = raw_lv_edmac_read(off2s);
+    }
+#endif
+    *width = pitch * 8 / raw_lv_get_bpp();
 
     /* 5D2 uses lv_raw_size >> 16, 5D3 uses lv_raw_height, so this hopefully covers both cases */
     *height = MAX((lv_raw_height & 0xFFFF) + 1, ((lv_raw_size >> 16) & 0xFFFF) + 1);
@@ -893,6 +1304,10 @@ int raw_update_params_work()
     int skip_right = 0;
     int skip_top = 0;
     int skip_bottom = 0;
+    /* where the first red pixel is in the raw buffer (row, column); the
+     * active area must start there, as readers assume RGGB */
+    int cfa_row = 0;
+    int cfa_col = 0;
 
     /* params useful for hardcoding buffer sizes, according to video mode */
     int mv = is_movie_mode();
@@ -933,6 +1348,24 @@ int raw_update_params_work()
 
         #ifdef CONFIG_EDMAC_RAW_SLURP
         raw_lv_realloc_buffer();
+        #endif
+
+        #ifdef RAW_LV_SOURCE_MEM1
+        if (!raw_lv_edmac_read(yb_xb))
+        {
+            /* Mem1Path runs in movie mode; in photo mode Canon's lv_save_raw
+             * switch turns it on (2384x968 there: full 3:2 view, 3x across,
+             * ~5x down), taking effect at the next frame */
+            call("lv_save_raw", 1);
+            raw_set_dirty_with_timeout(200);
+            return 0;
+        }
+        if (raw_lv_mem1_use_layout())
+        {
+            /* Canon programs the pack unit from it at the next frame */
+            raw_set_dirty_with_timeout(100);
+            return 0;
+        }
         #endif
 
         raw_info.buffer = raw_get_default_lv_buffer();
@@ -1061,6 +1494,34 @@ int raw_update_params_work()
         skip_left   = 0; // we can't crop properly yet, so this must be 0
         #endif
 
+        #ifdef CONFIG_M6II
+        #ifdef RAW_LV_SOURCE_MEM1
+        // Mem1 (sensor head, EDMAC ch 3): optical black at the left and
+        // top, image to the right and bottom edges, RGGB from the first
+        // image pixel.  Measured over USB: 1080p 2384x1348 (3x3 binning)
+        // black columns 0-47, 4K 3568x2000 (2x2) columns 0-71: the
+        // sensor's 144 black columns (as in CR3 stills) / horizontal
+        // binning.  Black rows 0-35 in both.  Binning from the width:
+        // ~7100 sensor columns are read.
+        {
+            int binning = MAX(1, (7104 + width / 2) / width);
+            skip_left   = 144 / binning;
+        }
+        skip_top    = 36;
+        #else
+        // Channel 1 LV raw frames (photo 1928x932, 1080p 2328x1306) have no
+        // optical black area at any edge: Canon crops it, keeping a black
+        // offset of ~128 (12-bit, measured with lens cap).
+        // But they start on a green pixel: G B / R G (checked with a red /
+        // blue test scene).  ML and MLV readers assume RGGB,
+        // so the active area starts one row lower (a column can't: packed
+        // 10/12-bit columns don't start on byte boundaries).
+        cfa_row     = 1;
+        skip_top    = 1;
+        skip_left   = 0;
+        #endif
+        #endif
+
         #ifdef CONFIG_200D
         // darktable source says:
         // Vertical x="0" width="260"
@@ -1090,6 +1551,8 @@ int raw_update_params_work()
     else if (QR_MODE) // image review after taking pics
     {
 #ifdef CONFIG_RAW_PHOTO
+        /* photo raw buffers use ML's layout (D4/D5) */
+        raw_layout = RAW_LAYOUT_ML;
 
         if (!can_use_raw_overlays_photo())
         {
@@ -1199,10 +1662,11 @@ int raw_update_params_work()
 
 /*********************** Portable code ****************************************/
 
-    /* skip offsets must be even */
-    skip_left   &= ~1;
+    /* skip offsets must keep the Bayer phase: the active area starts on
+     * the buffer's first red pixel (even offsets where that is (0, 0)) */
+    skip_left   = ((skip_left - cfa_col) & ~1) + cfa_col;
     skip_right  &= ~1;
-    skip_top    &= ~1;
+    skip_top    = ((skip_top - cfa_row) & ~1) + cfa_row;
     //skip_bottom &= ~1;
 
     if (width != raw_info.width || height != raw_info.height)
@@ -1224,7 +1688,33 @@ int raw_update_params_work()
     else
     {
         raw_capture_info.binning_x  = 3; raw_capture_info.skipping_x = 0;
-#ifdef CONFIG_5D3
+#ifdef CONFIG_M6II
+        /* from the measured LV raw sizes (6960 x 4640 active):
+         * 4K 3488 x 1958 = 2x2, 1080p 2328 x 1306 = 3x3 (16:9 of the full
+         * width).  Binning vs skipping not known; recorded as binning. */
+        /* crop factors from the active width: PROP_LV_AFFRAME's layout
+         * differs on DIGIC 8 */
+        raw_capture_info.sensor_res_x = 6960;
+        raw_capture_info.sensor_res_y = 4640;
+        if (width >= 3000)
+        {
+            raw_capture_info.binning_x = raw_capture_info.binning_y = 2;
+        }
+        else
+        {
+            raw_capture_info.binning_x = raw_capture_info.binning_y = 3;
+        }
+        raw_capture_info.skipping_x = raw_capture_info.skipping_y = 0;
+        #ifdef RAW_LV_SOURCE_MEM1
+        if (!is_movie_mode())
+        {
+            /* photo LV, Mem1 2384x968: the whole sensor height in ~932
+             * lines, ~5 rows each (binning or skipping not known) */
+            raw_capture_info.binning_y = 1;
+            raw_capture_info.skipping_y = 4;
+        }
+        #endif
+#elif defined(CONFIG_5D3)
         raw_capture_info.skipping_y = 0; raw_capture_info.binning_y  = mv720 ? 5 : 3;
 #elif defined(CONFIG_EOSM)
         raw_capture_info.binning_y  = 1; raw_capture_info.skipping_y = (mv720 || !RECORDING_H264) ? 4 : 2;
@@ -1245,7 +1735,21 @@ int raw_update_params_work()
 
     if (lv)
     {
-        if (width != raw_info.width || height != raw_info.height)
+        int format_changed = 0;
+        #if defined(CONFIG_DIGIC_8X) && !defined(CONFIG_EDMAC_RAW_SLURP)
+        /* the depth is whatever the EDMAC pack unit is set to; follow it */
+        int bpp = raw_lv_get_bpp();
+        int layout = raw_lv_get_layout();
+        if (bpp != raw_info.bits_per_pixel || layout != raw_layout)
+        {
+            raw_info.bits_per_pixel = bpp;
+            raw_layout = layout;
+            format_changed = 1;
+        }
+        #endif
+
+        int dims_changed = width != raw_info.width || height != raw_info.height;
+        if (dims_changed || format_changed)
         {
             /* raw dimensions changed in LiveView? return failure and wait for the next call */
             /* next valid call can be after two frames (until then, return failure) */
@@ -1261,8 +1765,15 @@ int raw_update_params_work()
             raw_info.width = width;
             raw_info.height = height;
 
-            /* reset black level to force recomputing */
-            raw_info.black_level = 0;
+            /* reset black level to force recomputing - except for a D8 depth
+             * change in ML's layout below 14 bit, where the levels are not
+             * measured again (recompute_black_and_white): the 14-bit ones
+             * stay for the recorder to scale (a reset left black 0 in the
+             * MLV headers of uncompressed 12 / 10-bit takes) */
+            if (dims_changed || raw_layout != RAW_LAYOUT_ML || raw_info.bits_per_pixel == 14)
+            {
+                raw_info.black_level = 0;
+            }
 
             dbg_printf("LV raw dimensions changed\n");
             return 0;
@@ -1289,9 +1800,11 @@ int raw_update_params_work()
     /* black and white autodetection are time-consuming */
     /* only refresh once per second or if dirty, but never while recording */
     static int bw_aux = INT_MIN;
-    int recompute_black_and_white = 
+    /* D4/D5 lower bit depths (PACK32 + digital gain) keep their 14-bit levels;
+     * D8's native layout is measured at whatever depth it has */
+    int recompute_black_and_white =
         NOT_RECORDING &&
-        raw_info.bits_per_pixel == 14 &&
+        (raw_info.bits_per_pixel == 14 || raw_layout == RAW_LAYOUT_LSB) &&
         (raw_info.black_level == 0 || dirty || should_run_polling_action(1000, &bw_aux));
 
     if (dirty)
@@ -1306,15 +1819,25 @@ int raw_update_params_work()
         return 1;
     }
 
-    raw_info.white_level = get_default_white_level();
-    ASSERT(raw_info.bits_per_pixel == 14);
+    raw_info.white_level = raw_level_to_bpp(get_default_white_level());
     int black_mean = 0, black_stdev_x100 = 0;
+    #ifdef RAW_LV_BLACK_LEVEL_14BIT
+    /* this LV raw source has no optical black area to measure from */
+    int ok = lv ? 1 : autodetect_black_level(&black_mean, &black_stdev_x100);
+    if (lv)
+    {
+        black_mean = raw_level_to_bpp(RAW_LV_BLACK_LEVEL_14BIT);
+        /* only feeds the dynamic range estimate; must not be 0 */
+        black_stdev_x100 = raw_level_to_bpp(RAW_LV_BLACK_NOISE_14BIT_X100);
+    }
+    #else
     int ok = autodetect_black_level(&black_mean, &black_stdev_x100);
+    #endif
     #ifdef BLACK_LEVEL
-    if (ABS(black_mean - BLACK_LEVEL) < 64)
+    if (ABS(black_mean - raw_level_to_bpp(BLACK_LEVEL)) < raw_level_to_bpp(64))
     {
         /* if we know the exact value, nail it down */
-        black_mean = BLACK_LEVEL;
+        black_mean = raw_level_to_bpp(BLACK_LEVEL);
     }
     #endif
 
@@ -1388,11 +1911,16 @@ int raw_update_params_work()
          * so we do this by compensating the white level manually
          * warning: this may exceed 16383!
          */
+        #ifdef SHAD_GAIN_REGISTER /* not known on D8 yet */
         int shad_gain = shamem_read(SHAD_GAIN_REGISTER);
 
-        raw_info.white_level -= raw_info.black_level;
-        raw_info.white_level = raw_info.white_level * 3444 / shad_gain; /* 0.25 EV correction, so LiveView matches CR2 exposure */
-        raw_info.white_level += raw_info.black_level;
+        if (shad_gain)
+        {
+            raw_info.white_level -= raw_info.black_level;
+            raw_info.white_level = raw_info.white_level * 3444 / shad_gain; /* 0.25 EV correction, so LiveView matches CR2 exposure */
+            raw_info.white_level += raw_info.black_level;
+        }
+        #endif
 
         /* in photo LiveView, ISO is not the one selected from Canon menu,
          * so the computed dynamic range has nothing to do with the one from CR2 pics
@@ -1471,11 +1999,18 @@ int raw_update_params()
         ans = raw_update_params_once();
     }
 
-    if (raw_info.bits_per_pixel != 14)
+    #ifndef CONFIG_DIGIC_8X
+    if (raw_info.bits_per_pixel != 14 && raw_layout == RAW_LAYOUT_ML)
     {
-        /* hack: this will disable all overlays at bit depths other than 14 */
+        /* hack: this will disable all overlays at bit depths other than 14
+         * (D4/D5 PACK32 modes) */
         return 0;
     }
+    #endif
+    /* D8 packs in the EDMAC channel, so raw_get_pixel reads either layout
+     * at its real depth (raw_layout.h).  ML's layout below 14 bit keeps the
+     * 14-bit levels measured before (see recompute_black_and_white), which
+     * the recorder scales to the depth */
 
     return ans;
 }
@@ -1501,6 +2036,16 @@ void raw_set_preview_rect(int x, int y, int w, int h, int obey_info_bars)
     /* fixme: handle different screen layouts */
     int top_margin      = (obey_info_bars) ? 38 : 0;
     int bottom_margin   = (obey_info_bars) ? 38 : 0;
+    #ifdef CONFIG_M6II
+    if (lv && is_movie_mode())
+    {
+        /* movie LiveView is 16:9: Canon shows it on rows 38..442 of the
+         * 3:2 screen, bars above and below; os stays the whole screen
+         * (ML's own bars are placed from it) */
+        top_margin    = 38;
+        bottom_margin = 37;
+    }
+    #endif
 
     /* scaling factor: raw width should match os.x_ex, same for raw height and os.y_ex */
     lv2raw.sx = 1024 * w / BM2LV_DX(os.x_ex);
@@ -1595,8 +2140,19 @@ raw_set_geometry(int width, int height, int skip_left, int skip_right, int skip_
     dbg_printf("  should be: (%d,%d) - (%d,%d)\n", raw_info.active_area.x1, raw_info.active_area.y1, raw_info.active_area.x2, raw_info.active_area.y2);
 }
 
+/* The helpers below pick pixels a (red, or green on odd rows) and h (green,
+ * or blue on the row above) of the 8-pixel raw_pixblock holding x.  These
+ * give the same pixels in any layout or bit depth. */
+#define RAW_PX_RED(x, y)    raw_get_pixel((x) & ~7, (y)/2*2)
+#define RAW_PX_GREEN(x, y)  raw_get_pixel(((x) & ~7) + 7, (y)/2*2)
+#define RAW_PX_BLUE(x, y)   raw_get_pixel(((x) & ~7) + 7, (y)/2*2 - 1)
+
 int FAST raw_red_pixel(int x, int y)
 {
+    if (!raw_is_ml14())
+    {
+        return RAW_PX_RED(x, y);
+    }
     struct raw_pixblock * buf = (void*)raw_info.buffer;
     y = (y/2) * 2;
     int i = ((y * raw_info.width + x) / 8);
@@ -1605,6 +2161,10 @@ int FAST raw_red_pixel(int x, int y)
 
 int FAST raw_green_pixel(int x, int y)
 {
+    if (!raw_is_ml14())
+    {
+        return RAW_PX_GREEN(x, y);
+    }
     struct raw_pixblock * buf = (void*)raw_info.buffer;
     y = (y/2) * 2;
     int i = ((y * raw_info.width + x) / 8);
@@ -1613,6 +2173,10 @@ int FAST raw_green_pixel(int x, int y)
 
 int FAST raw_blue_pixel(int x, int y)
 {
+    if (!raw_is_ml14())
+    {
+        return RAW_PX_BLUE(x, y);
+    }
     struct raw_pixblock * buf = (void*)raw_info.buffer;
     y = (y/2) * 2 - 1;
     int i = ((y * raw_info.width + x) / 8);
@@ -1621,6 +2185,10 @@ int FAST raw_blue_pixel(int x, int y)
 
 int FAST raw_red_pixel_dark(int x, int y)
 {
+    if (!raw_is_ml14())
+    {
+        return MIN(RAW_PX_RED(x, y), RAW_PX_RED(x, y - 2));
+    }
     struct raw_pixblock * buf = (void*)raw_info.buffer;
     y = (y/2) * 2;
     int i = ((y * raw_info.width + x) / 8);
@@ -1629,6 +2197,10 @@ int FAST raw_red_pixel_dark(int x, int y)
 
 int FAST raw_green_pixel_dark(int x, int y)
 {
+    if (!raw_is_ml14())
+    {
+        return MIN(RAW_PX_GREEN(x, y), RAW_PX_GREEN(x, y - 2));
+    }
     struct raw_pixblock * buf = (void*)raw_info.buffer;
     y = (y/2) * 2;
     int i = ((y * raw_info.width + x) / 8);
@@ -1637,6 +2209,10 @@ int FAST raw_green_pixel_dark(int x, int y)
 
 int FAST raw_blue_pixel_dark(int x, int y)
 {
+    if (!raw_is_ml14())
+    {
+        return MIN(RAW_PX_BLUE(x, y), RAW_PX_BLUE(x, y - 2));
+    }
     struct raw_pixblock * buf = (void*)raw_info.buffer;
     y = (y/2) * 2 - 1;
     int i = ((y * raw_info.width + x) / 8);
@@ -1645,6 +2221,10 @@ int FAST raw_blue_pixel_dark(int x, int y)
 
 int FAST raw_red_pixel_bright(int x, int y)
 {
+    if (!raw_is_ml14())
+    {
+        return MAX(RAW_PX_RED(x, y), RAW_PX_RED(x, y - 2));
+    }
     struct raw_pixblock * buf = (void*)raw_info.buffer;
     y = (y/2) * 2;
     int i = ((y * raw_info.width + x) / 8);
@@ -1653,6 +2233,10 @@ int FAST raw_red_pixel_bright(int x, int y)
 
 int FAST raw_green_pixel_bright(int x, int y)
 {
+    if (!raw_is_ml14())
+    {
+        return MAX(RAW_PX_GREEN(x, y), RAW_PX_GREEN(x, y - 2));
+    }
     struct raw_pixblock * buf = (void*)raw_info.buffer;
     y = (y/2) * 2;
     int i = ((y * raw_info.width + x) / 8);
@@ -1661,6 +2245,10 @@ int FAST raw_green_pixel_bright(int x, int y)
 
 int FAST raw_blue_pixel_bright(int x, int y)
 {
+    if (!raw_is_ml14())
+    {
+        return MAX(RAW_PX_BLUE(x, y), RAW_PX_BLUE(x, y - 2));
+    }
     struct raw_pixblock * buf = (void*)raw_info.buffer;
     y = (y/2) * 2 - 1;
     int i = ((y * raw_info.width + x) / 8);
@@ -1669,6 +2257,10 @@ int FAST raw_blue_pixel_bright(int x, int y)
 
 
 int FAST raw_get_pixel(int x, int y) {
+    if (!raw_is_ml14())
+    {
+        return raw_layout_get(raw_info.buffer + y * raw_info.pitch, raw_layout, raw_info.bits_per_pixel, x);
+    }
     struct raw_pixblock * p = (void*)raw_info.buffer + y * raw_info.pitch + (x/8)*14;
     switch (x%8) {
         case 0: return p->a;
@@ -1684,6 +2276,10 @@ int FAST raw_get_pixel(int x, int y) {
 }
 
 int FAST raw_get_pixel_ex(void* raw_buffer, int x, int y) {
+    if (!raw_is_ml14())
+    {
+        return raw_layout_get(raw_buffer + y * raw_info.pitch, raw_layout, raw_info.bits_per_pixel, x);
+    }
     struct raw_pixblock * p = (void*)raw_buffer + y * raw_info.pitch + (x/8)*14;
     switch (x%8) {
         case 0: return p->a;
@@ -1700,6 +2296,11 @@ int FAST raw_get_pixel_ex(void* raw_buffer, int x, int y) {
 
 void FAST raw_set_pixel(int x, int y, int value)
 {
+    if (!raw_is_ml14())
+    {
+        raw_layout_set(raw_info.buffer + y * raw_info.pitch, raw_layout, raw_info.bits_per_pixel, x, value);
+        return;
+    }
     struct raw_pixblock * p = (void*)raw_info.buffer + y * raw_info.pitch + (x/8)*14;
     switch (x%8) {
         case 0: p->a = value; break;
@@ -1936,7 +2537,10 @@ static int autodetect_black_level(int* black_mean, int* black_stdev_x100)
 //               raw_info.active_area.x2,
 //               raw_info.active_area.y1,
 //               raw_info.active_area.y2);
-    if (raw_info.active_area.x1 > 50) /* use the left black bar for black calibration */
+    /* use the left black bar for black calibration, if it leaves at least
+     * 16 columns between its 16-column margins (M6II Mem1: 48 columns; its
+     * top bar has non-image rows) */
+    if (raw_info.active_area.x1 >= 48)
     {
         // FIXME SJE are these magic numbers still appropriate for all cams?
         // I assume they are the black border sizes around the sensor.
@@ -2031,18 +2635,32 @@ static int autodetect_white_level(int initial_guess)
      * if we reduce the bit depth, the clipping point will span
      * only one or two levels - easier to detect */
     const int bin = 5;
-    int * hist = malloc((16384 >> bin) * sizeof(hist[0]));
+    const int levels = 1 << raw_info.bits_per_pixel;
+    int * hist = malloc((levels >> bin) * sizeof(hist[0]));
     if (!hist)
     {
         /* oops */
         ASSERT(0);
         return initial_guess;
     }
-    memset(hist, 0, (16384 >> bin) * sizeof(hist[0]));
+    memset(hist, 0, (levels >> bin) * sizeof(hist[0]));
 
     int raw_height = raw_info.active_area.y2 - raw_info.active_area.y1;
     for (int y = raw_info.active_area.y1 + raw_height/10; y < raw_info.active_area.y2 - raw_height/10; y += 3)
     {
+        if (!raw_is_ml14())
+        {
+            /* same samples as below (pixels 0 and 7 of every third
+             * 8-pixel block, 5% in from each side), any layout */
+            int x_skip = (raw_info.active_area.x2 - raw_info.active_area.x1) * 6/128 / 8 * 8;
+            for (int x = raw_info.active_area.x1 / 8 * 8 + x_skip; x < raw_info.active_area.x2 / 8 * 8 - x_skip; x += 24)
+            {
+                hist[raw_get_pixel(x, y) >> bin]++;
+                hist[raw_get_pixel(x + 7, y) >> bin]++;
+            }
+            continue;
+        }
+
         int pitch = raw_info.width/8*14;
         int row = (intptr_t) raw_info.buffer + y * pitch;
         int skip_5p = ((raw_info.active_area.x2 - raw_info.active_area.x1) * 6/128)/8*14; /* skip 5% */
@@ -2060,7 +2678,7 @@ static int autodetect_white_level(int initial_guess)
     }
 
     int acc = 0;
-    for (int i = (16384 >> bin) - 1; i >= MAX(initial_guess >> bin, 5); i--)
+    for (int i = (levels >> bin) - 1; i >= MAX(initial_guess >> bin, 5); i--)
     {
         qprintf("[WL] %d: %d\n", i << bin, hist[i]);
         /* the peak should be much bigger than what's after it,
@@ -2131,8 +2749,23 @@ static void* redirected_raw_buffer = 0;
 #endif
 
 /* to be called from vsync hooks */
+int raw_lv_can_redirect(void)
+{
+    #ifdef RAW_LV_SOURCE_MEM1
+    /* Mem1Path reprograms ch 3's address every frame from LiveViewDrive's
+     * parameters; ours only took when written after Canon's, which with
+     * the taller full 3:2 frame never happened (every other frame stale) */
+    return 0;
+    #else
+    return 1;
+    #endif
+}
+
 void FAST raw_lv_redirect_edmac(void* ptr)
 {
+    #ifdef RAW_LV_SOURCE_MEM1
+    return;
+    #endif
     #ifdef CONFIG_EDMAC_RAW_SLURP
     redirected_raw_buffer = (void*) CACHEABLE(ptr);
     #else
@@ -2223,6 +2856,18 @@ int raw_lv_settings_still_valid()
 #define QG ((int)(q->g_lo | (q->g_hi << 2)))
 #define QH ((int)(q->h))
 
+/* black in the LV YUV buffer: on DIGIC 6-8 chroma is stored with an offset
+ * of 0x80 (UYVY_PACK), so zero bytes show as green (mlv_play's bars, M6II) */
+static void FAST yuv_fill_black(void* dst, int bytes)
+{
+    uint32_t black = UYVY_PACK(0, 0, 0, 0);
+    uint32_t* p = dst;
+    for (int i = 0; i < bytes / 4; i++)
+    {
+        p[i] = black;
+    }
+}
+
 static void FAST raw_preview_color_work(void* raw_buffer, void* lv_buffer, int y1, int y2)
 {
     dbg_printf("Raw color preview...\n");
@@ -2285,13 +2930,13 @@ static void FAST raw_preview_color_work(void* raw_buffer, void* lv_buffer, int y
         if (yr <= preview_rect_y || yr >= preview_rect_y + preview_rect_h)
         {
             /* out of range, just fill with black */
-            memset(&lv32[LV(0,y)/4], 0, vram_lv.pitch);
+            yuv_fill_black(&lv32[LV(0,y)/4], vram_lv.pitch);
             continue;
         }
 
         /* fill left/right borders with black */
-        memset(&lv32[LV(0,y)/4],  0, LV(x1,y) - LV(0,y)/4*4);
-        memset(&lv32[LV(x2,y)/4], 0, LV(0,1) - LV(x2,0)/4*4);
+        yuv_fill_black(&lv32[LV(0,y)/4], LV(x1,y) - LV(0,y)/4*4);
+        yuv_fill_black(&lv32[LV(x2,y)/4], LV(0,1) - LV(x2,0)/4*4);
 
         struct raw_pixblock * row = (void*)raw + yr * raw_info.pitch;
 
@@ -2399,13 +3044,13 @@ static void FAST raw_preview_fast_work(void* raw_buffer, void* lv_buffer, int y1
         if (yr <= preview_rect_y || yr >= preview_rect_y + preview_rect_h)
         {
             /* out of range, just fill with black */
-            memset(&lv64[LV(0,y)/8], 0, vram_lv.pitch);
+            yuv_fill_black(&lv64[LV(0,y)/8], vram_lv.pitch);
             continue;
         }
 
         /* fill left/right borders with black */
-        memset(&lv64[LV(0,y)/8],  0, LV(x1,y) - LV(0,y)/8*8);
-        memset(&lv64[LV(x2,y)/8], 0, LV(0,1) - LV(x2,0)/8*8);
+        yuv_fill_black(&lv64[LV(0,y)/8], LV(x1,y) - LV(0,y)/8*8);
+        yuv_fill_black(&lv64[LV(x2,y)/8], LV(0,1) - LV(x2,0)/8*8);
 
         struct raw_pixblock * row = (void*)raw + yr * raw_info.pitch;
 
@@ -2418,6 +3063,7 @@ static void FAST raw_preview_fast_work(void* raw_buffer, void* lv_buffer, int y1
             int c = p->a;
             uint64_t Y = gamma[COERCE(c - black, 0, white-black) >> div];
             Y = (Y << 8) | (Y << 24) | (Y << 40) | (Y << 56);
+            Y |= (uint64_t) UYVY_PACK(0, 0, 0, 0) * 0x100000001ULL;   /* chroma offset, D6-8 */
             int idx = LV(x,y)/8;
             lv64[idx] = Y;
             lv64[idx + vram_lv.pitch/8] = Y;
@@ -2426,9 +3072,95 @@ static void FAST raw_preview_fast_work(void* raw_buffer, void* lv_buffer, int y1
     free(lv2rx);
 }
 
+/* the same previews for any layout and depth (D8 LSB-first, 10/12-bit),
+ * one pixel at a time through raw_layout_get; RGGB at even coordinates */
+static void FAST raw_preview_any_work(void* raw_buffer, void* lv_buffer, int y1, int y2, int color)
+{
+    uint32_t* lv32 = CACHEABLE(lv_buffer);
+    uint8_t* raw = CACHEABLE(raw_buffer);
+    if (!lv32 || !raw)
+    {
+        return;
+    }
+    int bpp = raw_info.bits_per_pixel;
+    int layout = raw_layout;
+    int pitch = raw_info.pitch;
+
+    int black = raw_info.black_level;
+    int white = raw_info.white_level;
+    int div = 0;
+    while (((white-black) >> div) >= 1024)
+    {
+        div++;
+    }
+
+    uint8_t gamma_rb[1024];
+    uint8_t gamma_g[1024];
+    for (int i = 0; i < 1024; i++)
+    {
+        int g_rb = COERCE(raw_to_ev((i << div) + black) + 11, 0, 10) * 255 / 10;
+        int g_g  = COERCE(raw_to_ev((i << div) + black) + 10, 0, 10) * 255 / 10;
+        gamma_rb[i] = COERCE(g_rb * g_rb / 255, 0, 255);
+        gamma_g[i]  = COERCE(g_g  * g_g  / 255, 0, 255);
+    }
+
+    int x1 = COERCE(RAW2LV_X(preview_rect_x), 0, vram_lv.width);
+    int x2 = COERCE(RAW2LV_X(preview_rect_x + preview_rect_w), 0, vram_lv.width);
+    if (x2 < x1) return;
+
+    int* lv2rx = malloc(x2 * 4);
+    if (!lv2rx) return;
+    for (int x = x1; x < x2; x++)
+        lv2rx[x] = LV2RAW_X(x) & ~1;
+
+    for (int y = y1; y < y2; y++)
+    {
+        int yr = LV2RAW_Y(y) & ~1;
+
+        if (yr <= preview_rect_y || yr + 1 >= preview_rect_y + preview_rect_h)
+        {
+            yuv_fill_black(&lv32[LV(0,y)/4], vram_lv.pitch);
+            continue;
+        }
+
+        yuv_fill_black(&lv32[LV(0,y)/4], LV(x1,y) - LV(0,y)/4*4);
+        yuv_fill_black(&lv32[LV(x2,y)/4], LV(0,1) - LV(x2,0)/4*4);
+
+        const uint8_t* row0 = raw + yr * pitch;     /* R G */
+        const uint8_t* row1 = row0 + pitch;         /* G B */
+
+        for (int x = x1; x < x2; x += 2)
+        {
+            int xr = lv2rx[x];
+            uint32_t yuv;
+            if (color)
+            {
+                int r = raw_layout_get(row0, layout, bpp, xr);
+                int g = (raw_layout_get(row0, layout, bpp, xr + 1) + raw_layout_get(row1, layout, bpp, xr)) >> 1;
+                int b = raw_layout_get(row1, layout, bpp, xr + 1);
+                r = gamma_rb[COERCE(r - black, 0, white-black) >> div];
+                g = gamma_g [COERCE(g - black, 0, white-black) >> div];
+                b = gamma_rb[COERCE(b - black, 0, white-black) >> div];
+                yuv = rgb2yuv422(r, g, b);
+            }
+            else
+            {
+                int g = raw_layout_get(row0, layout, bpp, xr + 1);
+                uint32_t Y = gamma_g[COERCE(g - black, 0, white-black) >> div];
+                yuv = UYVY_PACK(0, Y, 0, Y);
+            }
+            lv32[LV(x,y)/4] = yuv;
+        }
+    }
+    free(lv2rx);
+}
+
 void FAST raw_preview_fast_ex(void* raw_buffer, void* lv_buffer, int y1, int y2, int quality)
 {
-    if (raw_info.bits_per_pixel != 14)
+    /* the fast workers read struct raw_pixblock (ML layout, 14 bit);
+     * anything else goes through raw_preview_any_work */
+    int pixblocks = raw_is_ml14();
+    if (!pixblocks && (raw_info.bits_per_pixel < 10 || raw_info.bits_per_pixel > 16))
         return;
 
     yuv422_buffer_check();
@@ -2447,6 +3179,12 @@ void FAST raw_preview_fast_ex(void* raw_buffer, void* lv_buffer, int y1, int y2,
 
     if (quality == -1)
         quality = 0;
+
+    if (!pixblocks)
+    {
+        raw_preview_any_work(raw_buffer, lv_buffer, y1, y2, quality != RAW_PREVIEW_GRAY_ULTRA_FAST);
+        return;
+    }
 
     switch (quality)
     {
@@ -2661,6 +3399,41 @@ void raw_lv_request_bpp(int bpp)
 //            MODE_12BIT = 0x2000, // possibly 24 bit?
         };
     #endif
+    #if defined(CONFIG_DIGIC_8X) && !defined(CONFIG_EDMAC_RAW_SLURP)
+    /* D8 has no PACK32 stage: each EDMAC channel packs its own data.  The
+     * request is applied from raw_lv_bpp_vsync(); raw_update_params then
+     * follows the hardware.  Canon's LV depth is the most we can get, so
+     * asking for that or more means "leave Canon's depth". */
+    int canon_bpp = lv_raw_bpp_canon ? lv_raw_bpp_canon : raw_lv_get_bpp();
+    int req = (bpp >= canon_bpp) ? 0 : COERCE(bpp & ~1, 10, 14);
+    #ifdef RAW_LV_SOURCE_MEM1
+    /* Canon reprograms channel 3's pack unit and row size from Mem1Path
+     * every frame: switch both there (and never from raw_lv_bpp_vsync).
+     * mlv_lite asks at record start and back to 14 when it ends. */
+    int mem1 = raw_lv_mem1_set_depth(COERCE(bpp & ~1, 10, 14));
+    if (mem1 < 0)
+    {
+        printf("raw: Mem1 depth %d not possible here, staying at 14\n", bpp);
+    }
+    else if (mem1 > 0)
+    {
+        /* the first frame after resuming may still be in flight */
+        wait_lv_frames(2);
+    }
+    req = 0;
+    #endif
+    if (req != lv_raw_bpp_request)
+    {
+        lv_raw_bpp_request = req;
+        lv_raw_bpp_reverts = 0;
+        /* fixme: as on D4/D5, the first frames after switching may be mixed */
+        wait_lv_frames(2);
+        if (lv_raw_bpp_reverts)
+        {
+            printf("raw: Canon reset the bit depth %d times\n", lv_raw_bpp_reverts);
+        }
+    }
+    #else
     const uint32_t modes[] = { MODE_10BIT, MODE_12BIT, MODE_14BIT, MODE_16BIT};
 
     int bpp_index = COERCE((bpp-10)/2, 0, COUNT(modes));
@@ -2679,6 +3452,7 @@ void raw_lv_request_bpp(int bpp)
         /* fixme: after switching bit depth, EDMAC needs 1-2 frames to settle */
         wait_lv_frames(2);
     }
+    #endif
 
     give_semaphore(raw_sem);
 }
@@ -2795,8 +3569,9 @@ int can_use_raw_overlays()
 #ifdef CONFIG_RAW_LIVEVIEW
     if (lv && raw_lv_is_enabled())
     {
-        /* currently, raw overlays only work with 14 bits per pixel */
-        return raw_info.bits_per_pixel == 14;
+        /* raw overlays work with ML's 14-bit layout, and with D8's native
+         * layout through the generic pixel accessors */
+        return raw_is_ml14() || raw_layout == RAW_LAYOUT_LSB;
     }
 #endif
 

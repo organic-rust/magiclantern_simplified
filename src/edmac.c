@@ -2,6 +2,167 @@
 #include "dryos.h"
 #include "edmac.h"
 
+#if defined(CONFIG_DIGIC_8X) && defined(CONFIG_EDMAC_CHANNEL_TABLE)
+/* DIGIC 8: channel numbers are Canon's own Edmac.c indices, 0..N-1.
+ * Register bases, direction and connection IDs come from a per-platform
+ * table decoded from ROM.  Registers are outside the shamem range, so they
+ * are read directly. */
+#include "platform/edmac_channels.h"
+
+#define NUM_EDMAC_CHANNELS COUNT(edmac_channels)
+
+/* channels are numbered write first, then read */
+static uint32_t first_read_channel(void)
+{
+    for (uint32_t ch = 0; ch < NUM_EDMAC_CHANNELS; ch++)
+        if (edmac_channels[ch].flags & EDMAC_CHAN_FLAG_READ)
+            return ch;
+    return NUM_EDMAC_CHANNELS;
+}
+
+uint32_t edmac_get_dir(uint32_t channel)
+{
+    if (channel >= NUM_EDMAC_CHANNELS)
+    {
+        return EDMAC_DIR_UNUSED;
+    }
+
+    uint32_t flags = edmac_channels[channel].flags;
+    if (flags & EDMAC_CHAN_FLAG_WRITE)
+    {
+        return EDMAC_DIR_WRITE;
+    }
+    if (flags & EDMAC_CHAN_FLAG_READ)
+    {
+        return EDMAC_DIR_READ;
+    }
+    return EDMAC_DIR_UNUSED;
+}
+
+uint32_t edmac_channel_to_index(uint32_t channel)
+{
+    switch (edmac_get_dir(channel))
+    {
+        case EDMAC_DIR_WRITE:
+            return channel;
+        case EDMAC_DIR_READ:
+            return channel - first_read_channel();
+    }
+    return -1;
+}
+
+uint32_t edmac_index_to_channel(uint32_t index, uint32_t direction)
+{
+    uint32_t channel = -1;
+    switch (direction)
+    {
+        case EDMAC_DIR_WRITE:
+            channel = index;
+            break;
+        case EDMAC_DIR_READ:
+            channel = index + first_read_channel();
+            break;
+    }
+    return (edmac_get_dir(channel) == direction) ? channel : 0xFFFFFFFF;
+}
+
+uint32_t edmac_get_base(uint32_t channel)
+{
+    if (channel >= NUM_EDMAC_CHANNELS)
+    {
+        return -1;
+    }
+    return edmac_channels[channel].base;
+}
+
+uint32_t edmac_get_channel(uint32_t mmio_addr)
+{
+    uint32_t base = mmio_addr & ~0xFF;
+    for (uint32_t ch = 0; ch < NUM_EDMAC_CHANNELS; ch++)
+        if (edmac_channels[ch].base == base)
+            return ch;
+    return 0xFFFFFFFF;
+}
+
+static volatile struct edmac_mmio *edmac_regs(uint32_t channel)
+{
+    return (volatile struct edmac_mmio *)edmac_get_base(channel);
+}
+
+/* FIXME: inferred from Canon's start code (sets +0x04 = 1 to run), untested */
+uint32_t edmac_get_state(uint32_t channel)
+{
+    if (channel >= NUM_EDMAC_CHANNELS)
+    {
+        return -1;
+    }
+    return MEM(edmac_get_base(channel) + 0x04);
+}
+
+/* There is no D4/D5-style flags register; transfer_mode (+0xC0) holds the
+ * bitfields Canon's Edmac.c sets per transfer.  Format not decoded. */
+uint32_t edmac_get_flags(uint32_t channel)
+{
+    if (channel >= NUM_EDMAC_CHANNELS)
+    {
+        return -1;
+    }
+    return edmac_regs(channel)->transfer_mode;
+}
+
+uint32_t edmac_get_address(uint32_t channel)
+{
+    if (channel >= NUM_EDMAC_CHANNELS)
+    {
+        return -1;
+    }
+    return edmac_regs(channel)->ram_addr;
+}
+
+uint32_t edmac_get_pointer(uint32_t channel)
+{
+    if (channel >= NUM_EDMAC_CHANNELS)
+    {
+        return -1;
+    }
+    return edmac_regs(channel)->current_addr;
+}
+
+uint32_t edmac_get_length(uint32_t channel)
+{
+    if (channel >= NUM_EDMAC_CHANNELS)
+    {
+        return -1;
+    }
+    return edmac_regs(channel)->yb_xb;
+}
+
+/* Write channels route through Engine::BoomerSelector.c, read channels
+ * through Engine::BoomerVdKick.c; both look up a register via ROM tables
+ * indexed by conn_id >> 16.  FIXME: untested, the registers may not be
+ * readable. */
+uint32_t edmac_get_connection(uint32_t channel, uint32_t direction)
+{
+    if (channel >= NUM_EDMAC_CHANNELS || edmac_get_dir(channel) != direction)
+    {
+        return -1;
+    }
+
+    uint32_t conn_id = edmac_channels[channel].conn_id;
+    if (conn_id == 0xFFFFFFFF)
+    {
+        return 0xFF;
+    }
+
+    uint32_t index = conn_id >> 16;
+    uint32_t reg = (direction == EDMAC_DIR_WRITE)
+        ? MEM(EDMAC_BOOMER_SELECTOR_TABLE + 4 * index)
+        : MEM(EDMAC_BOOMER_VDKICK_TABLE + 12 * index + 8);
+    return MEM(reg);
+}
+
+#else // !(CONFIG_DIGIC_8X && CONFIG_EDMAC_CHANNEL_TABLE)
+
 #define WRITE(x) (x)
 #define READ(x)  (0x80000000 | (x))
 
@@ -283,6 +444,29 @@ uint32_t edmac_get_connection(uint32_t channel, uint32_t direction)
     return shamem_read(addr);
 }
 
+#endif // CONFIG_DIGIC_8X && CONFIG_EDMAC_CHANNEL_TABLE
+
+/* Modules are built without platform config, so they can't size their
+ * channel loops from NUM_EDMAC_CHANNELS. */
+uint32_t edmac_get_num_channels(void)
+{
+    return NUM_EDMAC_CHANNELS;
+}
+
+/* D8: register of the channel's pack/unpack unit, which sets the bit depth
+ * (bits 4-5: 0/1/2 = 10/12/14 bit) and the layout (bit 0: LSB-first, bit
+ * 20: ML's 16-bit words; neither: unpacked 16 bit); 0 if none */
+uint32_t edmac_get_pack_reg(uint32_t channel)
+{
+#if defined(CONFIG_DIGIC_8X) && defined(CONFIG_EDMAC_CHANNEL_TABLE)
+    if (channel < NUM_EDMAC_CHANNELS && edmac_channels[channel].pack_base)
+    {
+        return edmac_channels[channel].pack_base + 0x24;
+    }
+#endif
+    return 0;
+}
+
 int edmac_fix_off1(int32_t off)
 {
     /* the value is signed, but the number of bits is model-dependent */
@@ -307,6 +491,32 @@ int edmac_fix_off2(int32_t off)
     return off << (32-off2_bits) >> (32-off2_bits);
 }
 
+#if defined(CONFIG_DIGIC_8X) && defined(CONFIG_EDMAC_CHANNEL_TABLE)
+/* Register order matches the descriptor Canon's 0xE058096E (M6II) writes;
+ * offset bit widths are not known, so offsets are returned unmodified. */
+struct edmac_info edmac_get_info(uint32_t channel)
+{
+    volatile struct edmac_mmio *regs = edmac_regs(channel);
+    struct edmac_info info = {
+        .xs    = regs->ys_xs & 0xFFFF,
+        .ys    = regs->ys_xs >> 16,
+        .xa    = regs->ya_xa & 0xFFFF,
+        .ya    = regs->ya_xa >> 16,
+        .xb    = regs->yb_xb & 0xFFFF,
+        .yb    = regs->yb_xb >> 16,
+        .xn    = regs->yn_xn & 0xFFFF,
+        .yn    = regs->yn_xn >> 16,
+        .off1s = regs->off1s,
+        .off2s = regs->off2s,
+        .off1a = regs->off1a,
+        .off2a = regs->off2a,
+        .off1b = regs->off1b,
+        .off2b = regs->off2b,
+        .off3  = regs->off3,
+    };
+    return info;
+}
+#else
 struct edmac_info edmac_get_info(uint32_t channel)
 {
     uint32_t base = edmac_get_base(channel);
@@ -325,6 +535,7 @@ struct edmac_info edmac_get_info(uint32_t channel)
     };
     return info;
 }
+#endif
 
 // Great, a "total size" function that can return two different sizes.
 // FIXME: split this into two different top-level functions.
@@ -361,6 +572,10 @@ uint32_t edmac_get_total_size(struct edmac_info *info, int include_offsets)
 
 uint32_t edmac_bytes_per_transfer(uint32_t flags)
 {
+#if defined(CONFIG_DIGIC_8X) && defined(CONFIG_EDMAC_CHANNEL_TABLE)
+    /* D8 has no D4/D5-style flags register; format of transfer_mode unknown */
+    return 0;
+#endif
     switch (flags & EDMAC_BYTES_PER_TRANSFER_MASK)
     {
         case EDMAC_16_BYTES_PER_TRANSFER:
