@@ -472,7 +472,7 @@ static void iso_test()
     while(1)
     {
         static int iso = 72;
-    #ifdef FRAME_ISO
+    #ifdef CONFIG_FRAME_ISO_OVERRIDE    /* FRAME_ISO is read-only elsewhere (M6II) */
         FRAME_ISO = iso | (iso<<8);
     #endif
         msleep(10);

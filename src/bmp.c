@@ -149,6 +149,14 @@ uint8_t * bmp_vram(void)
 // 1 = copy idle to BMP
 void bmp_idle_copy(int direction, int fullsize)
 {
+#ifdef FEATURE_VRAM_RGBA
+    /* ML draws into its own indexed buffer, shown as a whole by
+     * refresh_yuv_from_rgb; there's no idle buffer to swap (bmp_vram()
+     * ignores bmp_draw_to_idle).  Copying between bmp_vram_real() and
+     * real ^ 0x80000 wrote 518 kB into Canon's display memory: mlv_play's
+     * text showed up twice, plus a band of noise (M6II). */
+    return;
+#endif
     uint8_t* real = bmp_vram_real();
     uint8_t* idle = bmp_vram_idle();
     ASSERT(real)
@@ -299,8 +307,17 @@ void refresh_yuv_from_rgb_task(void *unused)
     }
 }
 
+/* DIGIC 8: COLOR_TRANSPARENT_BLACK (3, COLOR_BG) is 50% black, as on older
+ * models.  Fully transparent (0), it was skipped by refresh_yuv_from_rgb and
+ * left whatever the layer held: text redrawn on COLOR_BG piled up
+ * (mlv_play's frame counter on M6II).  Not checked on DIGIC 6/7 yet. */
+#ifdef CONFIG_DIGIC_8X
+#define RGB_LUT_TRANSPARENT_BLACK 0x80000000
+#else
+#define RGB_LUT_TRANSPARENT_BLACK 0x00000000
+#endif
 static uint32_t indexed2rgbLUT[RGB_LUT_SIZE] = {
-    0x00000000, 0xffebebeb, 0xff000000, 0x00000000, 0xffa33800, // 0
+    0x00000000, 0xffebebeb, 0xff000000, RGB_LUT_TRANSPARENT_BLACK, 0xffa33800, // 0
     0xff20bbd9, 0xff009900, 0xff01ad01, 0xffea0001, 0xff0042d4, // 5
     0xffb9bb8c, 0xff1c237e, 0xffc80000, 0xff0000a8, 0xffc9009a, // 10
     0xffd1c000, 0xffe800e8, 0xffd95e4c, 0xff003e4b, 0xffe76d00, // 15
@@ -1480,9 +1497,16 @@ static void bmp_init(void* unused)
     bmp_vram_indexed = malloc(BMP_VRAM_SIZE);
     // initialise to transparent, this allows us to draw over
     // existing screen, rather than replace it, due to checks
-    // in refresh_yuv_from_rgb()
+    // in refresh_yuv_from_rgb().  Index 0 (fully transparent, as
+    // clrscr() uses), not COLOR_TRANSPARENT_BLACK: on DIGIC 8 that one is
+    // 50% black in the LUT, which veiled the whole screen after boot
+    // until a menu cleared it (M6II)
     if (bmp_vram_indexed != NULL)
+        #ifdef CONFIG_DIGIC_8X
+        memset(bmp_vram_indexed, 0, BMP_VRAM_SIZE);
+        #else
         memset(bmp_vram_indexed, COLOR_TRANSPARENT_BLACK, BMP_VRAM_SIZE);
+        #endif
     else
         ASSERT(1);
 #endif

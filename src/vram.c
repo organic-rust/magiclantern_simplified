@@ -11,6 +11,7 @@
 #include "shoot.h"
 #include "zebra.h"
 #include "raw.h"
+#include "imgconv.h"
 
 //~ #define CONFIG_DEBUGMSG 1
 
@@ -708,7 +709,17 @@ void vram_clear_lv()
 {
     struct vram_info * lv_vram = get_yuv422_vram();
     if (!lv_vram->vram) return;
+    #ifdef CONFIG_DIGIC_678X
+    /* chroma is stored with a 0x80 offset: zero bytes show as green */
+    uint32_t black = UYVY_PACK(0, 0, 0, 0);
+    uint32_t *p = (uint32_t *) lv_vram->vram;
+    for (int i = 0; i < lv_vram->height * lv_vram->pitch / 4; i++)
+    {
+        p[i] = black;
+    }
+    #else
     memset(lv_vram->vram, 0, lv_vram->height * lv_vram->pitch);
+    #endif
 }
 
 // those properties may signal a screen layout change

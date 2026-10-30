@@ -441,7 +441,7 @@ int FAST raw_hist_get_percentile_levels(int* percentiles_x10, int* output_raw_va
     memset(hist, 0, 16384*4);
 
     int off = get_y_skip_offset_for_histogram();
-    if (speed == 0 && gray_projection == GRAY_PROJECTION_GREEN)
+    if (speed == 0 && gray_projection == GRAY_PROJECTION_GREEN && raw_uses_pixblocks())
     {
         /* time: 1-2 seconds on full raw 5D3 */
         //~ int t0 = get_ms_clock();

@@ -3545,6 +3545,30 @@ static void draw_zoom_overlay(int dirty)
 }
 #endif // FEATURE_MAGIC_ZOOM
 
+/* which of liveview_display_idle()'s common conditions fail, as bits:
+ * 1 display off, 2 LV paused, 4 job not ready, 8 menu, 16 mirror down,
+ * 32 gui_state, 64 GUI mode, 128 GUI mode 2, 256 no LiveViewApp dialog
+ * (D678).  0 = overlays may draw (for logs: why they stop) */
+int liveview_display_idle_why()
+{
+    int why =
+        (!DISPLAY_IS_ON ? 1 : 0) |
+        (!LV_NON_PAUSED ? 2 : 0) |
+        (!job_state_ready_to_take_pic() ? 4 : 0) |
+        (menu_active_and_not_hidden() ? 8 : 0) |
+        (mirror_down ? 16 : 0) |
+        (gui_state != GUISTATE_IDLE ? 32 : 0) |
+        (CURRENT_GUI_MODE > 3 ? 64 : 0);
+    #ifdef CURRENT_GUI_MODE_2
+    why |= (CURRENT_GUI_MODE_2 > 3 ? 128 : 0);
+    #endif
+    #ifdef CONFIG_DIGIC_678X
+    extern struct dialog* LiveViewApp_dialog;
+    why |= (!LiveViewApp_dialog ? 256 : 0);
+    #endif
+    return why;
+}
+
 int liveview_display_idle()
 {
 // Common conditions required across all generations
