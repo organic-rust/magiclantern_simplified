@@ -47,15 +47,36 @@ extern int send_software_interrupt(uint32_t interrupt, uint32_t shifted_cpu_id);
 extern void *memcpy_dryos(void *dst, const void *src, uint32_t count);
 //extern void early_printf(char *fmt, ...);
 
+// 64k RAM pages handed out so far (static pool first, then extra pages)
+static uint32_t backing_page_index = 0;
+
+#if defined(CONFIG_MMU_REMAP_EXTRA_PAGES)
+// More pages than the static pool (generic_mmu_space) holds, added on
+// request by mmu_reserve_remap_pages() from the heap: cams where a larger
+// BSS doesn't boot (M6II: one static page).  Pages past the static pool
+// come from this list.
+static uint8_t *extra_pages[CONFIG_MMU_REMAP_EXTRA_PAGES];
+static uint32_t extra_count = 0;
+static uint32_t static_pages = 0; // pages in phys_mem_pages; 0 = no extra pages yet
+#endif
+
+static uint8_t *backing_page(uint32_t index)
+{
+#if defined(CONFIG_MMU_REMAP_EXTRA_PAGES)
+    if (static_pages && index >= static_pages)
+        return extra_pages[index - static_pages];
+#endif
+    return global_mmu_conf.phys_mem_pages + MMU_PAGE_SIZE * index;
+}
+
 static int assign_64k_to_L2_table(struct patch *patch,
                                   struct mmu_L2_page_info *L2_page)
 {
     // SJE TODO can / should we use a semaphore here?  I'm not sure we can
     // given the fairly early context we want to call this.
 
-    // This index is how far into our set of available 64k RAM pages
-    // we are.  When exhausted, we have no more RAM to back ROM edits.
-    static uint32_t backing_page_index = 0;
+    // backing_page_index is how far into our set of available 64k RAM
+    // pages we are.  When exhausted, we have no more RAM to back ROM edits.
 
     // An L2 section is split into 64kB "large pages", of which there can be 16
     // in use.  Determine which of these wants to be used.
@@ -71,7 +92,7 @@ static int assign_64k_to_L2_table(struct patch *patch,
         if (backing_page_index >= global_mmu_conf.max_64k_pages_remapped)
             return -1;
 
-        pages[i] = global_mmu_conf.phys_mem_pages + MMU_PAGE_SIZE * backing_page_index;
+        pages[i] = backing_page(backing_page_index);
         qprintf("Rom->Ram copy: 0x%08x, 0x%08x\n", (uint32_t)patch->addr & 0xffff0000, pages[i]);
         memcpy_dryos(pages[i],
                      (uint8_t *)((uint32_t)patch->addr & 0xffff0000),
@@ -763,6 +784,94 @@ static int init_remap_mmu(void)
     return 0;
 }
 
+#if defined(CONFIG_MMU_REMAP_EXTRA_PAGES)
+// One more remap page with its own L2 table (a page per 1MB section), from
+// a 128 kB heap block taken for good: the 64 kB-aligned page, and the L2
+// table and a grown copy of the L2 info array in the space beside it
+// (tables already in use keep their address).  On request only: a
+// permanent block at boot (2 pages, ~200 kB of Canon's malloc pool, which
+// had 375 kB free) froze the camera when dmlog's engio hooks started (they
+// allocate ~400 kB more); without it they ran - most likely memory, not
+// the remap.  Not from interrupts (malloc).
+static int mmu_add_remap_page(void)
+{
+    if (!mmu_globals_initialised || extra_count >= CONFIG_MMU_REMAP_EXTRA_PAGES)
+        return -1;
+
+    uint32_t old_tables = global_mmu_conf.max_L2_tables;
+    uint8_t *mem = malloc(2 * MMU_PAGE_SIZE);
+    if (mem == NULL || (uint32_t)mem >= 0x40000000)
+    {
+        // (an uncached alias would put the wrong memory type in the tables)
+        printf("MMU: no memory for a remap page (%x)\n", mem);
+        if (mem)
+            free(mem);
+        return -1;
+    }
+
+    // the page, and the larger of the gaps before / after it
+    uint8_t *page = (uint8_t *)ROUND_UP((uint32_t)mem, MMU_PAGE_SIZE);
+    uint32_t before = page - mem;
+    uint8_t *gap = (before >= MMU_PAGE_SIZE / 2) ? mem : page + MMU_PAGE_SIZE;
+    uint8_t *L2_table = (uint8_t *)ROUND_UP((uint32_t)gap, MMU_L2_TABLE_SIZE);
+    struct mmu_L2_page_info *info = (struct mmu_L2_page_info *)(L2_table + MMU_L2_TABLE_SIZE);
+    // the larger gap is at least 32 kB: room for both
+
+    struct mmu_L2_page_info *t = &info[old_tables];
+    for (int j = 0; j < 16; j++)
+        t->phys_mem[j] = NULL;
+    t->L2_table = L2_table;
+    t->virt_page_mapped = 0;
+    t->in_use = 0;
+
+    // copy and switch with interrupts off: a patch applied meanwhile
+    // (by another task) can't be lost
+    uint32_t old_int = cli();
+    memcpy(info, global_mmu_conf.L2_tables, sizeof(struct mmu_L2_page_info) * old_tables);
+    if (!static_pages)
+        static_pages = global_mmu_conf.max_64k_pages_remapped;
+    extra_pages[extra_count++] = page;
+    global_mmu_conf.L2_tables = info;
+    global_mmu_conf.max_L2_tables = old_tables + 1;
+    global_mmu_conf.max_64k_pages_remapped++;
+    sei(old_int);
+
+    printf("MMU: remap page %d added at %x\n", global_mmu_conf.max_64k_pages_remapped, page);
+    return 0;
+}
+
+// Before patching ROM: makes sure at least n 64k pages and n L2 tables
+// are free, adding pages as needed (up to CONFIG_MMU_REMAP_EXTRA_PAGES).
+// Returns how many pages and tables are free afterwards (the smaller).
+// Callers that patch one page need 1; the static page counts.
+int mmu_reserve_remap_pages(int n)
+{
+    static volatile int busy = 0;
+    if (busy)
+        return 0;
+    busy = 1;
+    int free_now = 0;
+    while (1)
+    {
+        uint32_t free_pages = global_mmu_conf.max_64k_pages_remapped - backing_page_index;
+        uint32_t free_tables = 0;
+        for (uint32_t i = 0; i < global_mmu_conf.max_L2_tables; i++)
+            if (!global_mmu_conf.L2_tables[i].in_use)
+                free_tables++;
+        free_now = MIN(free_pages, free_tables);
+        if (free_now >= n || mmu_add_remap_page() != 0)
+            break;
+    }
+    busy = 0;
+    return free_now;
+}
+#else
+int mmu_reserve_remap_pages(int n)
+{
+    return 0;
+}
+#endif
+
 int mmu_init(void)
 {
     if (mmu_globals_initialised)
@@ -944,9 +1053,14 @@ static uint8_t *find_phys_mem(uint32_t virtual_addr)
     uint32_t i;
     for(i = 0; i < global_mmu_conf.max_L2_tables; i++)
     {
-        L2_table = &global_mmu_conf.L2_tables[i];
-        if (L2_table->virt_page_mapped == L2_aligned_virt_addr)
+        // only a matching table (a miss used to leave the last one here,
+        // harmless with a single table)
+        if (global_mmu_conf.L2_tables[i].virt_page_mapped == L2_aligned_virt_addr
+            && global_mmu_conf.L2_tables[i].in_use)
+        {
+            L2_table = &global_mmu_conf.L2_tables[i];
             break;
+        }
     }
     if (L2_table == NULL)
         return NULL;

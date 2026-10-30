@@ -42,4 +42,9 @@ int apply_normal_patches(void);
 // and applies compile-time specified patches from platform/XXD/include/platform/mmu_patches.h
 int mmu_init(void);
 
+// Before patching ROM at run time: at least n free remap pages (64 kB of
+// ROM each) and L2 tables, adding pages from the heap where the camera
+// allows (CONFIG_MMU_REMAP_EXTRA_PAGES).  Returns how many are free.
+int mmu_reserve_remap_pages(int n);
+
 #endif // _patch_mmu_h_
