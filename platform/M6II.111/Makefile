@@ -18,7 +18,16 @@ CFLAGS_PLATFORM = -mthumb -mlong-calls
 PLATFORM_ARCH = armv7-a
 
 ML_BOOT_OBJ = boot-d678.o
+
+# USB access for debugging: CHDK-style memory read/write from a PC
+CONFIG_PTP = y
+CONFIG_PTP_CHDK = y
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/function_overrides.o
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/crx_enc.o
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/full32_core.o
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/movrec_mem.o
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/preshoot.o
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/lv_mode.o
 
 include ../Makefile
 .DEFAULT_GOAL := $(BUILD_DIR)/cam_complete

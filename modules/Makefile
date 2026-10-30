@@ -52,9 +52,12 @@ ML_MODULES = \
     adv_int \
     crop_rec \
     dev_tools/edmac \
+    dev_tools/dmlog \
     sd_clock \
     raw_video/raw_vidx \
-    yolo
+    yolo \
+    d8_modes \
+    rawprev
 
 .PHONY: clean $(BUILD_DIR)
 
