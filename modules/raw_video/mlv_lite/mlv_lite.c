@@ -61,6 +61,8 @@
 #include "lvinfo.h"
 #include "beep.h"
 #include "raw.h"
+#include "crx_enc.h"
+#include "raw_layout.h"
 #include "zebra.h"
 #include "focus.h"
 #include "lens.h"
@@ -68,6 +70,7 @@
 #include "fps.h"
 #include "../mlv_rec/mlv.h"
 #include "../mlv_rec/mlv_rec_interface.h"
+#include "../rate_fit.h"
 #include "../../trace/trace.h"
 #include "powersave.h"
 #include "shoot.h"
@@ -85,6 +88,9 @@ static GUARDED_BY(GuiMainTask) int show_edmac = 0;
 
 /* from mlv_play module */
 extern WEAK_FUNC(ret_0) void mlv_play_file(char *filename);
+
+/* from raw.c, DIGIC 8 only */
+extern WEAK_FUNC(ret_0) int raw_lv_get_bpp_reverts();
 
 /* camera-specific tricks */
 static int cam_eos_m = 0;
@@ -136,6 +142,9 @@ static CONFIG_INT("raw.aspect.ratio", aspect_ratio_index, 10);
 
 static CONFIG_INT("raw.write.speed", measured_write_speed, 0);
 static int measured_write_speeds[CARD_COUNT] = {0};
+
+/* largest single card write: 32M-512K (CFDMA writes up to FFFF sectors) */
+#define MAX_WRITE_SIZE (0xFFFE * 512)
 static int measured_compression_ratio = 0;
 
 static CONFIG_INT("raw.pre-record", pre_record, 0);
@@ -159,6 +168,10 @@ static CONFIG_INT("raw.preview", preview_mode, 0);
 #define PREVIEW_HACKED (preview_mode == 3)
 
 static CONFIG_INT("raw.warm.up", warm_up, 0);
+/* -1: the camera's default, set at init (on where the card goes into speed
+ * class recording mode, whose slow start the warm-up is for) */
+static CONFIG_INT("raw.start.warmup", start_warmup, -1);
+static CONFIG_INT("raw.take.log", take_log, 0);
 static CONFIG_INT("raw.use.srm.memory", use_srm_memory, 1);
 static CONFIG_INT("raw.small.hacks", small_hacks, 1);
 
@@ -172,7 +185,177 @@ static CONFIG_INT("raw.output_format", output_format, 3);
 #define OUTPUT_14BIT_LOSSLESS 3
 #define OUTPUT_12BIT_LOSSLESS 4
 #define OUTPUT_AUTO_BIT_LOSSLESS 5
-#define OUTPUT_COMPRESSION (output_format>2)
+extern WEAK_FUNC(ret_0) int crx_enc_available(void);
+extern WEAK_FUNC(ret_0) int crx_enc_ready(void);
+extern WEAK_FUNC(ret_1) int raw_lv_can_redirect(void);
+extern WEAK_FUNC(ret_0) int crx_enc_setup(int width, int height, int bits, int pitch_px, int lossy);
+extern WEAK_FUNC(ret_0) int crx_enc_frame(void *src, int x_off, void *out, int out_max, int *enc_us, int *copy_us);
+
+static int ps_take = 0;             /* this take records the 1:1 source (see below) */
+
+/* DIGIC 8: Canon's CR3 encoder (src/crx_enc.c), lossless or C-RAW, on the
+ * LV raw stream (LSB-first for it); a separate setting, as output_format
+ * picks the depth */
+static CONFIG_INT("raw.crx", crx_compress, 0);
+/* (1:1 takes are always CR3-coded, by Canon's own 2-tile jobs) */
+#define OUTPUT_CRX ((crx_compress || ps_take) && crx_enc_available())
+static int crx_last_enc_us = 0;     /* last frame: time in the encoder */
+static int crx_last_copy_us = 0;    /* last frame: copying its output */
+static int crx_sum_enc_us = 0, crx_sum_copy_us = 0, crx_max_us = 0, crx_frames = 0;
+#define OUTPUT_COMPRESSION (output_format>2 || OUTPUT_CRX)
+
+extern WEAK_FUNC(ret_0) int crx_copy_parts(uint8_t *dst, uint32_t n, const uint32_t *addrs, const uint32_t *sizes);
+extern WEAK_FUNC(ret_0) void crx_enc_done(void);
+/* M6II: LiveView in movie / photo mode with the dial on photo (platform
+ * lv_mode.c); 1 when done */
+extern WEAK_FUNC(ret_0) int lv_set_movie_mode(int movie);
+#define LV_MODE_SWITCH ((thunk) lv_set_movie_mode != (thunk) ret_0)
+/* raw takes from photo mode (raw_photo_rec_task): off for now.  The switch
+ * to movie LiveView works and takes record, but LiveView froze during the
+ * take and the switch back didn't restart it (camera unresponsive). */
+#define PHOTO_MODE_TAKES 0
+static volatile int photo_take = 0;         /* this take switched LiveView from photo mode */
+static volatile int photo_switching = 0;    /* REC in photo mode: switching to movie LiveView */
+#include "preshoot.h"
+extern WEAK_FUNC(ret_0) int preshoot_take_get(struct preshoot_take *take);
+extern WEAK_FUNC(ret_0) void preshoot_take_set_crop(int width, int height);
+extern WEAK_FUNC(ret_1) int preshoot_mode_start(void);
+extern WEAK_FUNC(ret_0) void preshoot_mode_stop(void);
+extern WEAK_FUNC(ret_1) int preshoot_movie_enable(int x0, int width, int y0, int height, int bits, int (*frame_cbr)(uint32_t handle));
+extern WEAK_FUNC(ret_0) void preshoot_movie_disable(void);
+extern WEAK_FUNC(ret_0) int preshoot_movie_frame(void);
+extern WEAK_FUNC(ret_0) void preshoot_movie_release(uint32_t handle);
+extern WEAK_FUNC(ret_0) void preshoot_movie_stats(int *started, int *skipped, int *failed, int *wrong_depth, int *resets);
+extern WEAK_FUNC(ret_0) int preshoot_movie_race(int *v);
+extern WEAK_FUNC(ret_0) void preshoot_movie_set_lossless(int on);
+extern WEAK_FUNC(ret_0) int preshoot_set_23976(int on);
+static int ps_canon_started = 0;
+/* 1:1 crop takes (core preshoot.c, src/preshoot.h): a sensor-mode
+ * module (d8_modes) chooses the source, the band (its Readout) and the
+ * rate (preshoot_take_config); the crop comes from RAW video's own
+ * Resolution and Aspect ratio within the band, its depth from Data format
+ * and its coding from Compression (always CR3: C-RAW unless lossless).
+ * Canon's 1:1 frame is 5376 x 3560 with optical black in columns 0..143
+ * and rows 0..71.  REC switches movie LiveView to Canon's 1:1 mode (PoCom
+ * MechalessStart, once the card is warm), REC stops it. */
+static struct preshoot_take ps_cfg;     /* the next take's band */
+static int ps_next_x0, ps_next_y0, ps_next_w, ps_next_h;    /* the next take's crop */
+static void raw_menu_refresh(void);
+static void ps_next_crop(void)
+{
+    /* centred, x0 and width in 16 px (as Canon's encoder jobs), height in 8 */
+    int w = MIN(resolution_presets_x[resolution_index_x] + res_x_fine, ps_cfg.width) & ~15;
+    w = MAX(w, 64);
+    int num = aspect_ratio_presets_num[aspect_ratio_index];
+    int den = aspect_ratio_presets_den[aspect_ratio_index];
+    int h = MIN(w * den / num, ps_cfg.height) & ~7;
+    h = MAX(h, 64);
+    ps_next_w = w;
+    ps_next_h = h;
+    ps_next_x0 = ps_cfg.x0 + (((ps_cfg.width - w) / 2) & ~15);
+    ps_next_y0 = ps_cfg.y0 + (((ps_cfg.height - h) / 2) & ~1);
+    preshoot_take_set_crop(w, h);
+}
+static int ps_cfg_on(void)
+{
+    int on = preshoot_take_get(&ps_cfg);
+    if (on)
+    {
+        ps_next_crop();
+    }
+    return on;
+}
+#define one_to_one  ps_cfg_on()
+#define MOVIE_1TO1_SOURCE (is_movie_mode() && one_to_one)
+static int ps_movie = 0;            /* this take: the movie mode 1:1 source */
+static int ps_bits = 14;            /* this take's */
+static int ps_w = 5232, ps_h = 2192, ps_x0 = 144, ps_y0 = 720;     /* this take's */
+#define PS_W_MAX    5232
+#define PS_W        (ps_take ? ps_w : (ps_cfg_on(), ps_next_w))
+#define PS_H        (ps_take ? ps_h : (ps_cfg_on(), ps_next_h))
+#define PS_X0       (ps_take ? ps_x0 : (ps_cfg_on(), ps_next_x0))
+#define PS_Y0       (ps_take ? ps_y0 : (ps_cfg_on(), ps_next_y0))
+/* 14, 12 or 10 from Data format (the lossless-JPEG formats: their container) */
+#define PS_BITS     (ps_take ? ps_bits : bpp_container[output_format])
+/* source of lossy (C-RAW) takes: Canon's pipeline after its defect
+ * correction and digital gain ("DEFOE": 1:1 takes' EDMAC ch 1) or its head
+ * (HEAD: before gain and correction, Mem1).  So far 1:1 takes record DEFOE
+ * (no full-size HEAD in the 1:1 mode) and ordinary takes HEAD.  Hot pixels
+ * Canon's defect map doesn't list are left to post. */
+static CONFIG_INT("raw.lossy.source", lossy_src, 0);
+#define LOSSY_SRC_HEAD  (lossy_src == 1)
+static int ps_fps = 23976;          /* this take's, x1000 */
+/* compressed 14-bit 2.39:1 frames were 7-10 MB: 11 MB, scaled to the
+ * crop height and depth */
+/* C-RAW (0) or lossless (1, Canon's full RAW job: CRX tiles, no DWT) */
+static int ps_lossless = 0;         /* this take's */
+#define PS_LOSSLESS (ps_take ? ps_lossless : crx_compress == 1)
+/* lossless: bounded by the uncompressed size (headers, worst case) */
+#define PS_MAX_FRAME (PS_LOSSLESS ? PS_W * PS_H * PS_BITS / 8 + (1 << 16) \
+                                  : (11 << 20) / 2192 * PS_H / 12 * (PS_BITS - 2) / (PS_W_MAX / 16) * (PS_W / 16))
+#define PS_LV_GAP_MS 2000           /* LiveView off this long ends a take */
+#define PS_PENDING  8               /* frames between the callback and the copy */
+#define PS_PARTS    200
+static struct ps_frame
+{
+    int slot;
+    uint32_t n, hdr_size;
+    uint32_t addr[PS_PARTS], size[PS_PARTS];
+    uint32_t handle;                /* movie mode: ours to give back */
+} ps_pending[PS_PENDING];
+static volatile uint32_t ps_pend_head = 0, ps_pend_tail = 0;
+static int ps_started_cbr = 0;      /* MLV_REC_EVENT_STARTED sent */
+/* Sound starts with the first frame, but Canon's sound input takes ~220 ms
+ * to open, and players line sound and picture up at their starts: frames
+ * captured before the sound runs are not recorded.  A frame's encode ends
+ * ~50 ms after it was captured (a clap test: the sound 49 ms before the
+ * frame's timestamp); its VIDF timestamp is moved back by that. */
+#define PS_ENC_LATENCY_US 50000
+static volatile uint64_t ps_sound_t0 = 0;  /* when STARTED returned, 0 = not yet */
+
+/* the first seconds of each recording, printed to the console when it
+ * stops early (M6II CRX takes could stop within ~1 s of starting): when
+ * each frame was captured, compressed and written */
+#define TL_EVENTS 384
+#define TL_MS 8000      /* warm-up (up to 5 s) plus the first frames */
+static struct { int ms; char type; int a, b, c; } tl[TL_EVENTS];
+static volatile int tl_n = 0;
+static int tl_t0 = 0;
+/* M6II: image sensor temperature (PROP_IMAGE_TEMP, deg C + 128; core
+ * PROP_EFIC_TEMP) at REC, for the take log */
+extern int efic_temp;
+static int tl_temp0 = 0;
+#define SENSOR_CELSIUS(t) (is_camera("M6II", "1.1.1") && (t) ? (t) - 128 : -999)
+static int tl_early_stop = 0;
+
+static void tl_add(char type, int a, int b, int c)
+{
+    int ms = get_ms_clock() - tl_t0;
+    if (ms > TL_MS)
+    {
+        return;
+    }
+    if (type == 'R' || type == 'W' || type == 'w' || type == 'P')
+    {
+        /* task context only: also into Canon's debug log, between the
+         * card driver's messages (dmlog) */
+        char t[2] = { type, 0 };
+        DryosDebugMsg(0, 15, "mlv_lite tl %d %s %d %d", ms, t, a, b);
+    }
+    uint32_t old = cli();
+    if (tl_n < TL_EVENTS)
+    {
+        tl[tl_n].ms = ms;
+        tl[tl_n].type = type;
+        tl[tl_n].a = a;
+        tl[tl_n].b = b;
+        tl[tl_n].c = c;
+        tl_n++;
+    }
+    sei(old);
+}
+
+static void tl_print(int early_stop, int named);
 
 /* container BPP (variable for uncompressed, always 14 for lossless JPEG) */
 static const int bpp_container[] = { 14, 12, 10, 14, 14, 14, 14, 14, 14 };
@@ -180,7 +363,21 @@ static const int bpp_container[] = { 14, 12, 10, 14, 14, 14, 14, 14, 14 };
 /* "fake" lower bit depths using digital gain (for lossless JPEG) */
 //static const int bpp_digi_gain[] = { 14, 14, 14, 14, 12, 11, 10,  9,  8 };
 
-#define BPP     bpp_container[output_format]
+/* DIGIC 8 native layout (LSB-first): the LV raw stream as Canon's CR3
+ * encoder reads it.  The camera packs at the depth output_format asks for
+ * (EDMAC pack unit) while recording; Canon's LV depth is the most it can
+ * send.  Only CRX takes record it (the encoder's input). */
+#define NATIVE_LAYOUT   (raw_get_layout() == RAW_LAYOUT_LSB)
+/* DIGIC 8 Mem1 can also pack in ML's own layout (Canon's setting there;
+ * checked at 14, 12 and 10 bit): uncompressed takes must use it (a take
+ * fails if the camera stays LSB-first), CRX takes stay LSB-first.  A
+ * no-op where the layout is fixed. */
+extern WEAK_FUNC(ret_0) void raw_lv_request_layout(int layout);
+
+/* a function, since some callers have a raw_info parameter hiding the global */
+static int native_bpp();
+
+#define BPP     (NATIVE_LAYOUT ? native_bpp() : bpp_container[output_format])
 #define BPP_D   (raw_digital_gain_ok() ? bpp_digital_gain() : 14)
 
 static int bpp_digital_gain()
@@ -288,6 +485,11 @@ static GUARDED_BY(settings_sem) int configured_pre_recording_settings = 0;
 
 static GUARDED_BY(LiveViewTask) int skip_x = 0;
 static GUARDED_BY(LiveViewTask) int skip_y = 0;
+
+/* first row of the recorded area: skip_y rounded down to a whole Bayer
+ * row pair, counted from the active area (which starts on a red row; on
+ * M6II that is row 1 of the LV frame) */
+#define CROP_Y0 (skip_y - ((skip_y - raw_info.active_area.y1) & 1))
 static GUARDED_BY(LiveViewTask) int frame_offset_x = 0;
 static GUARDED_BY(LiveViewTask) int frame_offset_y = 0;
 static GUARDED_BY(GuiMainTask)  int frame_offset_delta_x = 0;
@@ -306,6 +508,17 @@ static volatile int raw_recording_state = RAW_IDLE;
 #define RAW_IS_RECORDING (raw_recording_state == RAW_RECORDING || \
                           raw_recording_state == RAW_PRE_RECORDING)
 #define RAW_IS_FINISHING (raw_recording_state == RAW_FINISHING)
+
+/* while recording: what the camera sends (raw_info follows the hardware);
+ * when idle, the camera is at Canon's depth: show what we will ask for */
+static int native_bpp()
+{
+    if (RAW_IS_IDLE)
+    {
+        return MIN(bpp_container[output_format], raw_info.bits_per_pixel);
+    }
+    return raw_info.bits_per_pixel;
+}
 
 #define VIDF_HDR_SIZE 64
 
@@ -343,6 +556,42 @@ static GUARDED_BY(settings_sem) int valid_slot_count = 0;           /* total min
 static GUARDED_BY(LiveViewTask) int capture_slot = -1;              /* in what slot are we capturing now (index) */
 static volatile                 int force_new_buffer = 0;           /* if some other task decides it's better to search for a new buffer */
 
+/* 1:1 takes (ps_take): Canon's encoder hands each frame over with its size
+ * known, so frames don't need worst-case slots.  Each gets a slot of its
+ * exact size, appended to a ring over the memory chunks; the writer frees
+ * them oldest first, and the space is reused from there.  With worst-case
+ * slots (max_frame_size) and 4-6 MB frames in 13 MB slots, the space left
+ * by shrinking rarely added up to a whole slot again: 16:9 takes buffered
+ * only 6-9 frames.
+ * A few small ordinary slots come first, for mlv_snd's audio blocks
+ * (mlv_rec_get_free_slot).  Unused ring slots: SLOT_RESERVED, ptr 0. */
+#define PS_RING_REGIONS     16
+#define PS_AUDIO_SLOTS      4
+#define PS_AUDIO_SLOT_SIZE  (2 << 20)
+static int ps_ring = 0;                 /* this take's slots are a ring */
+static int ps_ring_first = 0;           /* index of the first ring slot */
+static int ps_ring_nreg = 0;
+static struct { void *base; uint32_t size; uint32_t start; } ps_ring_reg[PS_RING_REGIONS];
+static uint32_t ps_ring_total = 0;      /* bytes in all regions */
+static uint64_t ps_ring_head = 0;       /* next allocation: bytes since the take started */
+static uint32_t ps_ring_head_at = 0;    /* the same, within the ring (0 .. total - 1) */
+static uint64_t ps_ring_pos[COUNT(slots)];  /* where each live ring slot starts */
+static uint32_t ps_ring_at[COUNT(slots)];   /* the same, within the ring */
+static int ps_ring_last_size = 0;       /* last frame's slot size, for free estimates */
+
+/* 1:1 takes start Canon's 1:1 mode before the card warm-up: frames are
+ * encoded but not recorded, to measure the rate the take will need; the
+ * warm-up then waits until the card writes that fast (PS_READY_MS) */
+#define PS_MEAS_FRAMES      16
+static volatile int ps_measuring = 0;
+static volatile int ps_meas_n = 0;      /* frames measured */
+static volatile int ps_meas_size[PS_MEAS_FRAMES];
+/* ordinary CRX takes use the ring too (slots reserved worst-case at vsync,
+ * shrunk to the frame once encoded); their warm-up measures frames the
+ * compress task encodes into the ring's start (CRX_MEASURE_MSG) */
+#define CRX_MEASURE_MSG     0x40000000
+static volatile int crx_measure_pending = 0;
+
 
 static GUARDED_BY(LiveViewTask) int writing_queue[COUNT(slots)+1];  /* queue of completed frames (slot indices) waiting to be saved */
 static GUARDED_BY(LiveViewTask) int writing_queue_tail = 0;         /* place captured frames here */
@@ -353,6 +602,7 @@ static GUARDED_BY(LiveViewTask) int skipped_frames = 0;             /* how many 
 static GUARDED_BY(RawRecTask)   int chunk_frame_count[CARD_COUNT] = {0};          /* how many frames in the current file chunk */
 static volatile                 int buffer_full = 0;                /* true when the memory becomes full */
        GUARDED_BY(RawRecTask)   char *raw_movie_filename = NULL;      /* file name for current (or last) movie */
+static GUARDED_BY(RawRecTask)   int raw_movie_file_created = 0;       /* this take created raw_movie_filename */
 static GUARDED_BY(RawRecTask)   char chunk_filename[CARD_COUNT][FIO_MAX_PATH_LENGTH] = {0};          /* file name for current movie chunk */
 static GUARDED_BY(RawRecTask)   int64_t written_total[CARD_COUNT] = {0};          /* how many bytes we have written in this movie */
 static GUARDED_BY(RawRecTask)   int64_t written_chunk[CARD_COUNT] = {0};          /* same for current chunk */
@@ -363,6 +613,7 @@ static volatile                 uint32_t skip_frames = 0;
 
 /* for compress_task */
 static struct msg_queue * compress_mq = 0;
+static volatile int compress_stopped = 0;   /* compress_task has seen the stop message */
 
 static GUARDED_BY(RawRecTask)   mlv_file_hdr_t file_hdr[CARD_COUNT];
 static GUARDED_BY(RawRecTask)   mlv_rawi_hdr_t rawi_hdr;
@@ -522,6 +773,38 @@ void mlv_rec_release_slot(int32_t slot, uint32_t write)
 
     if(write)
     {
+        /* at the end of a take, drop trailing NULL blocks (mlv_snd: the
+         * unused audio blocks of its slots, ~19 MB per clip); a slot with
+         * nothing else isn't written.  Not while recording: a shortened
+         * slot would come back as a reserved remnant, not a whole slot */
+        uint32_t used = slots[slot].size;
+        int trim = RAW_IS_FINISHING;
+        if (trim)
+        {
+            used = 0;
+        }
+        for (uint32_t off = 0; trim && off + sizeof(mlv_hdr_t) <= (uint32_t) slots[slot].size; )
+        {
+            mlv_hdr_t *hdr = (mlv_hdr_t *)(slots[slot].ptr + off);
+            if (hdr->blockSize < sizeof(mlv_hdr_t) || off + hdr->blockSize > (uint32_t) slots[slot].size)
+            {
+                /* not a block chain: keep the slot as it is */
+                used = slots[slot].size;
+                break;
+            }
+            off += hdr->blockSize;
+            if (memcmp(hdr->blockType, "NULL", 4) != 0)
+            {
+                used = off;
+            }
+        }
+        if (used == 0)
+        {
+            slots[slot].status = SLOT_FREE;
+            return;
+        }
+        slots[slot].size = used;
+
         uint32_t old_int = cli();
         slots[slot].status = SLOT_FULL;
         slots[slot].is_meta = 1;
@@ -533,6 +816,84 @@ void mlv_rec_release_slot(int32_t slot, uint32_t write)
     {
         slots[slot].status = SLOT_FREE;
     }
+}
+
+/* Frame rate metadata, measured (no rounding to standard rates): all of a
+ * take's VIDF timestamps are fitted against the frame index (from the time
+ * gaps, so frames that weren't recorded don't bias it); mlv_snd reports the
+ * audio clock measured against the same clock (get_us_clock).  At the end
+ * the header gets fps = video rate x 48000 / audio rate - what keeps a
+ * player that runs the audio at its nominal sample rate in sync - or the
+ * video rate alone without sound.  Nom / denom with denom 1000000. */
+#define FPS_META_DENOM 1000000
+static struct rate_fit vfit;
+static uint64_t vfit_last_us = 0;
+static uint32_t vfit_index = 0;
+static double vfit_period_us = 0;
+static int vfit_audio_mhz = 0;      /* from mlv_snd at STOPPING: measured, mHz (0 = no sound) */
+static int vfit_audio_nominal = 0;  /* and the nominal sample rate (WAVI), Hz */
+static int vfit_audio_err_ppm = 0;  /* and its standard error */
+
+static void vfit_reset(int fps_x1000)
+{
+    rate_fit_reset(&vfit);
+    vfit_last_us = 0;
+    vfit_index = 0;
+    vfit_period_us = fps_x1000 > 0 ? (double) 1000000000 / fps_x1000 : (double) 41708;
+    vfit_audio_mhz = 0;
+    vfit_audio_nominal = 0;
+    vfit_audio_err_ppm = 0;
+}
+
+/* a frame recorded at t_us (VIDF timestamp) */
+static void vfit_add(uint64_t t_us)
+{
+    if (vfit.n)
+    {
+        /* frame periods since the last recorded frame */
+        double dt = (double) (t_us - vfit_last_us);
+        int steps = (int) (dt / vfit_period_us + (double) 0.5);
+        vfit_index += MAX(steps, 1);
+    }
+    rate_fit_add(&vfit, vfit_index, t_us);
+    vfit_last_us = t_us;
+    if (vfit.n >= 16 && (vfit.n & 15) == 0)
+    {
+        /* follow the measured period (configurable frame timers) */
+        double p = rate_fit_period_us(&vfit);
+        if (p > 0)
+        {
+            vfit_period_us = p;
+        }
+    }
+}
+
+void mlv_rec_set_audio_rate(int nominal_hz, int measured_mhz, int err_ppm)
+{
+    vfit_audio_nominal = nominal_hz;
+    vfit_audio_mhz = measured_mhz;
+    vfit_audio_err_ppm = err_ppm;
+}
+
+/* fps x FPS_META_DENOM for the header; 0 if not measured */
+static uint32_t vfit_meta_fps(double *video_fps, double *audio_hz)
+{
+    double v = rate_fit_rate(&vfit);
+    double a = vfit_audio_mhz / (double) 1000;
+    *video_fps = v;
+    *audio_hz = a;
+    if (v <= 0)
+    {
+        return 0;
+    }
+    /* relative to the audio clock only when that is measured well: a few
+     * 0.5 s chunks of a short take gave offsets of up to 2000 ppm, varying
+     * from take to take (a real clock offset doesn't) */
+    double dev_ppm = (a > 0 && vfit_audio_nominal > 0) ? (a / vfit_audio_nominal - 1) * (double) 1000000 : 0;
+    int audio_ok = a > 0 && vfit_audio_nominal > 0 && vfit_audio_err_ppm > 0 && vfit_audio_err_ppm <= 50 &&
+                   dev_ppm > -500 && dev_ppm < 500;
+    double meta = audio_ok ? v * vfit_audio_nominal / a : v;
+    return (uint32_t) (meta * FPS_META_DENOM + (double) 0.5);
 }
 
 /* set the timestamp relative to recording start */
@@ -570,6 +931,11 @@ static void refresh_cropmarks()
     if (lv_dispsize > 1 || raw_rec_should_preview() || !raw_video_enabled)
     {
         reset_movie_cropmarks();
+    }
+    else if (one_to_one)
+    {
+        /* 1:1 takes: the sensor-mode module draws the crop */
+        return;
     }
     else
     {
@@ -696,6 +1062,16 @@ void update_resolution_params()
         // We use a fast memcpy variant, but are limited to full width copies.
         res_x = max_res_x;
     }
+    if (is_camera("M6II", "1.1.1") && !OUTPUT_COMPRESSION)
+    {
+        /* M6II mem-to-mem copies need rows in whole 4-byte units (8 px at
+         * 12-bit, 16 px at 10/14-bit): 4K 3496 px is fine at 12-bit (5244
+         * bytes), 3488 at 14-bit (3496 would be 6118).  In either layout:
+         * LSB-first while idle, ML's while recording uncompressed, so the
+         * width can't change at REC */
+        int unit = 32 / (BPP & -BPP);   /* pixels per 4 bytes: 32 / gcd(BPP, 32) */
+        res_x -= res_x % unit;
+    }
 
     /* res Y */
     int num = aspect_ratio_presets_num[aspect_ratio_index];
@@ -789,8 +1165,197 @@ static char* guess_aspect_ratio(int res_x, int res_y)
     return msg;
 }
 
+/* ring position of the oldest frame not yet written (the head if none) */
+static uint64_t ps_ring_tail()
+{
+    uint64_t tail = ps_ring_head;
+    for (int i = ps_ring_first; i < total_slot_count; i++)
+    {
+        if (slots[i].ptr && (slots[i].status == SLOT_CAPTURING || slots[i].status == SLOT_FULL ||
+                             slots[i].status == SLOT_WRITING) && ps_ring_pos[i] < tail)
+        {
+            tail = ps_ring_pos[i];
+        }
+    }
+    return tail;
+}
+
+/* a slot of exactly size bytes at the ring's head (skipping the rest of a
+ * region it doesn't fit in), unless that reaches frames not written yet;
+ * -1 if full */
+static int ps_ring_alloc(int size)
+{
+    uint32_t old = cli();
+    int d = -1;
+    for (int i = ps_ring_first; i < total_slot_count && d < 0; i++)
+    {
+        if (!slots[i].ptr && slots[i].status == SLOT_RESERVED)
+        {
+            d = i;
+        }
+    }
+    uint64_t tail = ps_ring_tail();
+    uint64_t p = ps_ring_head;
+    uint32_t at = ps_ring_head_at;
+    int r = -1;
+    for (int tries = 0; d >= 0 && tries <= ps_ring_nreg; tries++)
+    {
+        int k = 0;
+        while (k < ps_ring_nreg - 1 && at >= ps_ring_reg[k + 1].start)
+        {
+            k++;
+        }
+        uint32_t off = at - ps_ring_reg[k].start;
+        if (off + size <= ps_ring_reg[k].size)
+        {
+            r = k;
+            break;
+        }
+        /* to the next region's start */
+        uint32_t skip = ps_ring_reg[k].size - off;
+        p += skip;
+        at += skip;
+        if (at >= ps_ring_total)
+        {
+            at -= ps_ring_total;
+        }
+    }
+    if (r < 0 || p + size - tail > ps_ring_total)
+    {
+        sei(old);
+        return -1;
+    }
+    slots[d].ptr = ps_ring_reg[r].base + (at - ps_ring_reg[r].start);
+    slots[d].size = size;
+    slots[d].is_meta = 0;
+    ps_ring_pos[d] = p;
+    ps_ring_at[d] = at;
+    ps_ring_head = p + size;
+    ps_ring_head_at = at + size;
+    if (ps_ring_head_at >= ps_ring_total)
+    {
+        ps_ring_head_at -= ps_ring_total;
+    }
+    if (size < max_frame_size)
+    {
+        /* an exact 1:1 frame; CRX reservations are the worst case, their
+         * real size comes with ps_ring_shrink */
+        ps_ring_last_size = size;
+    }
+    sei(old);
+    return d;
+}
+
+/* an ordinary CRX frame is encoded: its slot (reserved worst-case at
+ * vsync) shrinks to it; the rest goes back to the ring if nothing was
+ * reserved after it yet (the usual case: encoding takes ~half a frame) */
+static void ps_ring_shrink(int i, int payload)
+{
+    if (payload < 0)
+    {
+        payload = 0;
+    }
+    int new_size = (VIDF_HDR_SIZE + ((payload + 3) & ~3) + 8 + 511) & ~511;
+    uint32_t old = cli();
+    int old_size = slots[i].size;
+    if (new_size < old_size)
+    {
+        if (ps_ring_pos[i] + old_size == ps_ring_head)
+        {
+            ps_ring_head -= old_size - new_size;
+            ps_ring_head_at = ps_ring_at[i] + new_size;
+            if (ps_ring_head_at >= ps_ring_total)
+            {
+                ps_ring_head_at -= ps_ring_total;
+            }
+        }
+        slots[i].size = new_size;
+        ps_ring_last_size = new_size;
+    }
+    slots[i].payload_size = payload;
+    ((mlv_vidf_hdr_t*)slots[i].ptr)->blockSize = slots[i].size;
+    sei(old);
+}
+
+static void ps_ring_add_suite(struct memSuite * mem_suite, int fullres_buf_size)
+{
+    if (!mem_suite)
+    {
+        return;
+    }
+    for (struct memChunk * chunk = GetFirstChunkFromSuite(mem_suite); chunk; chunk = GetNextMemoryChunk(mem_suite, chunk))
+    {
+        intptr_t ptr = (intptr_t) GetMemoryAddressOfMemoryChunk(chunk);
+        int size = GetSizeOfMemoryChunk(chunk);
+        if ((void *) ptr == fullsize_buffers[0])
+        {
+            /* the LiveView frame's double-buffer copy (ordinary takes) */
+            ptr += fullres_buf_size;
+            size -= fullres_buf_size;
+        }
+        intptr_t aligned = (ptr + 63) & ~63;
+        size -= aligned - ptr;
+        ptr = aligned;
+        /* the audio slots first */
+        while (total_slot_count < PS_AUDIO_SLOTS && size >= PS_AUDIO_SLOT_SIZE)
+        {
+            slots[total_slot_count].ptr = (void *) ptr;
+            slots[total_slot_count].size = PS_AUDIO_SLOT_SIZE;
+            slots[total_slot_count].payload_size = PS_AUDIO_SLOT_SIZE;
+            slots[total_slot_count].status = SLOT_FREE;
+            slots[total_slot_count].is_meta = 0;
+            total_slot_count++;
+            valid_slot_count++;
+            ptr += PS_AUDIO_SLOT_SIZE;
+            size -= PS_AUDIO_SLOT_SIZE;
+        }
+        size &= ~511;
+        if (size >= max_frame_size && ps_ring_nreg < PS_RING_REGIONS)
+        {
+            ps_ring_reg[ps_ring_nreg].base = (void *) ptr;
+            ps_ring_reg[ps_ring_nreg].size = size;
+            ps_ring_reg[ps_ring_nreg].start = ps_ring_total;
+            ps_ring_total += size;
+            ps_ring_nreg++;
+        }
+    }
+}
+
+/* returns 1 if there's room for at least two worst-case frames */
+static int ps_ring_setup(int fullres_buf_size)
+{
+    total_slot_count = valid_slot_count = 0;
+    ps_ring_nreg = 0;
+    ps_ring_total = 0;
+    ps_ring_head = 0;
+    ps_ring_head_at = 0;
+    ps_ring_last_size = max_frame_size / 2;
+    ps_ring_add_suite(shoot_mem_suite, fullres_buf_size);
+    ps_ring_add_suite(srm_mem_suite, fullres_buf_size);
+    ps_ring_first = total_slot_count;
+    for (int i = ps_ring_first; i < COUNT(slots); i++)
+    {
+        slots[i].ptr = 0;
+        slots[i].size = 0;
+        slots[i].status = SLOT_RESERVED;
+        slots[i].is_meta = 0;
+    }
+    total_slot_count = COUNT(slots);
+    /* worst-case frames that surely fit (the menu's estimates use it) */
+    valid_slot_count += ps_ring_total / max_frame_size;
+    ps_ring = 1;
+    printf("1:1 ring: %d audio slots, %d regions, %s\n", ps_ring_first, ps_ring_nreg, format_memory_size(ps_ring_total));
+    return ps_ring_total >= (uint32_t) max_frame_size * 2;
+}
+
 static int count_free_slots()
 {
+    if (ps_ring)
+    {
+        /* frames of the last one's size that would still fit */
+        uint32_t used = ps_ring_head - ps_ring_tail();
+        return (ps_ring_total - MIN(used, ps_ring_total)) / MAX(ps_ring_last_size, 512);
+    }
     int free_slots = 0;
     for (int i = 0; i < total_slot_count; i++)
         if (slots[i].status == SLOT_FREE)
@@ -810,6 +1375,13 @@ static int get_estimated_compression_ratio()
     {
         /* we have a measurement from a recent frame */
         return measured_compression_ratio;
+    }
+
+    if (OUTPUT_CRX)
+    {
+        /* 1080p in movie mode measured 1.51-1.53:1;
+         * C-RAW stills were ~70% of the lossless size (guess until measured) */
+        return crx_compress == 2 ? 46 : 66;
     }
 
     /* reasonable defaults */
@@ -947,7 +1519,7 @@ void setup_bit_depth_digital_gain(int force_off)
 static REQUIRES(settings_sem)
 void setup_bit_depth()
 {
-    raw_lv_request_bpp(BPP);
+    raw_lv_request_bpp(NATIVE_LAYOUT ? bpp_container[output_format] : BPP);
     setup_bit_depth_digital_gain(0);
 }
 
@@ -955,6 +1527,7 @@ void setup_bit_depth()
 static REQUIRES(settings_sem)
 void restore_bit_depth()
 {
+    raw_lv_request_layout(RAW_LAYOUT_LSB);
     raw_lv_request_bpp(14);
     setup_bit_depth_digital_gain(1);
 }
@@ -1018,8 +1591,10 @@ void refresh_raw_settings(int force)
             setup_buffers();
             setup_bit_depth_digital_gain(0);
 
-            /* update compression ratio once every 2 seconds */
-            if (OUTPUT_COMPRESSION && compress_mq && should_run_polling_action(2000, &aux2))
+            /* update compression ratio once every 2 seconds
+             * (not for CRX: each encode makes Canon's AlgsMgr take and give
+             * back its SRM memory; CRX measures while recording) */
+            if (OUTPUT_COMPRESSION && !OUTPUT_CRX && compress_mq && should_run_polling_action(2000, &aux2))
             {
                 measure_compression_ratio();
             }
@@ -1032,6 +1607,11 @@ end:
 
 static int calc_crop_factor()
 {
+    if (one_to_one)
+    {
+        /* 1:1: no binning, of the sensor's 6960-px active width */
+        return raw_capture_info.sensor_crop * 6960 / PS_W;
+    }
     int sensor_res_x = raw_capture_info.sensor_res_x;
     int camera_crop  = raw_capture_info.sensor_crop;
     int sampling_x   = raw_capture_info.binning_x + raw_capture_info.skipping_x;
@@ -1046,7 +1626,22 @@ static MENU_UPDATE_FUNC(raw_main_update)
     refresh_cropmarks();
     
     if (!raw_video_enabled) return;
-    
+
+    if (!is_movie_mode())
+    {
+        MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Movie mode only.");
+        return;
+    }
+
+    if (MOVIE_1TO1_SOURCE && RAW_IS_IDLE)
+    {
+        /* as the other modes: the take's size, its crop factor */
+        MENU_SET_VALUE("ON, %dx%d", PS_W, PS_H);
+        int crop_factor = calc_crop_factor();
+        if (crop_factor) MENU_SET_RINFO("%s%d.%02dx", FMT_FIXEDPOINT2( crop_factor ));
+        return;
+    }
+
     refresh_raw_settings(0);
 
     if (!RAW_IS_IDLE)
@@ -1097,6 +1692,27 @@ static MENU_UPDATE_FUNC(resolution_update)
     }
     
     refresh_raw_settings(1);
+
+    if (one_to_one)
+    {
+        /* the 1:1 crop; LiveView's raw geometry (res_x / res_y) stays 1080p's */
+        MENU_SET_VALUE("%dx%d", PS_W, PS_H);
+        MENU_SET_RINFO("%s%d.%02dx", FMT_FIXEDPOINT2(calc_crop_factor()));
+        int want = resolution_presets_x[resolution_index_x] + res_x_fine;
+        if (want > ps_cfg.width)
+        {
+            MENU_SET_HELP("1:1: %d is wider than the band (max %d).", want, ps_cfg.width);
+        }
+        else
+        {
+            MENU_SET_HELP("1:1 crop, centred in the Readout band (%dx%d).", ps_cfg.width, ps_cfg.height);
+        }
+        if (PS_W < PS_W_MAX)
+        {
+            MENU_SET_WARNING(MENU_WARN_INFO, "1:1: widths other than 5232 not tested with Canon's encoder yet.");
+        }
+        return;
+    }
 
     MENU_SET_VALUE("%dx%d", res_x, res_y);
     int crop_factor = calc_crop_factor();
@@ -1149,7 +1765,7 @@ static MENU_SELECT_FUNC(resolution_change_fine_value)
     
     /* fine-tune resolution in small increments */
     int cur_res = ((resolution_presets_x[resolution_index_x] + res_x_fine) + 15) & ~15;
-    cur_res = COERCE(cur_res + delta * 16, resolution_presets_x[0], max_res_x); 
+    cur_res = COERCE(cur_res + delta * 16, resolution_presets_x[0], one_to_one ? ps_cfg.width : max_res_x);
 
     /* select the closest preset */
     int max_delta = INT_MAX;
@@ -1179,6 +1795,21 @@ static MENU_UPDATE_FUNC(aspect_ratio_update)
 
     int num = aspect_ratio_presets_num[aspect_ratio_index];
     int den = aspect_ratio_presets_den[aspect_ratio_index];
+
+    if (one_to_one)
+    {
+        if (PS_W * den / num > ps_cfg.height)
+        {
+            MENU_SET_VALUE(guess_aspect_ratio(PS_W, PS_H));
+            MENU_SET_HELP("1:1: %s is taller than the Readout band: cut to its %d rows.", aspect_ratio_choices[aspect_ratio_index], ps_cfg.height);
+        }
+        else
+        {
+            MENU_SET_HELP("1:1 crop: %dx%d, centred in the Readout band.", PS_W, PS_H);
+        }
+        return;
+    }
+
     int selected_y = calc_res_y(res_x, max_res_y, num, den, squeeze_factor);
     
     if (selected_y > max_res_y + 2)
@@ -1194,9 +1825,71 @@ static MENU_UPDATE_FUNC(aspect_ratio_update)
     write_speed_update(entry, info);
 }
 
+static MENU_UPDATE_FUNC(crx_compress_update)
+{
+    if (one_to_one)
+    {
+        /* Canon's own 2-tile jobs; the LiveView encoder setup doesn't apply */
+        if (!crx_compress)
+        {
+            MENU_SET_VALUE("OFF (1:1: C-RAW)");
+            MENU_SET_WARNING(MENU_WARN_INFO, "1:1 takes are always CR3-coded: OFF records C-RAW.");
+        }
+        else if (crx_compress == 1)
+        {
+            /* guess: lossless CRX ~ (bits - 6.5) bits/px on this sensor's noise */
+            int bpp10 = MAX(30, PS_BITS * 10 - 65);
+            int fps = ps_cfg.fps_24p ? 24 : 30;
+            int mbs = (int)((int64_t) PS_W * PS_H * bpp10 / 80 * fps / 1000000);
+            MENU_SET_RINFO("~%d MB/s?", mbs);
+            if (PS_BITS == 14)
+            {
+                MENU_SET_WARNING(MENU_WARN_ADVICE, "1:1: 14-bit lossless needs more than this card writes; 10- or 12-bit.");
+            }
+        }
+        return;
+    }
+    if (!crx_compress)
+    {
+        return;
+    }
+    MENU_SET_RINFO("~%d%%", get_estimated_compression_ratio());
+    if (!crx_enc_ready())
+    {
+        MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Canon's CR3 encoder isn't set up yet; recording won't start.");
+    }
+    else if (crx_last_enc_us || crx_last_copy_us)
+    {
+        MENU_SET_WARNING(MENU_WARN_INFO, "Last frame: encode %d.%d ms, copy %d.%d ms.",
+            crx_last_enc_us / 1000, (crx_last_enc_us / 100) % 10,
+            crx_last_copy_us / 1000, (crx_last_copy_us / 100) % 10);
+    }
+    else
+    {
+        MENU_SET_WARNING(MENU_WARN_ADVICE, crx_compress == 2
+            ? "EXPERIMENTAL: Canon's C-RAW (lossy). No in-camera playback yet."
+            : "EXPERIMENTAL: Canon's CR3 encoder, lossless. Needs a CRX-aware MLV reader.");
+    }
+}
+
 static MENU_UPDATE_FUNC(output_format_update)
 {
     refresh_raw_settings(0);
+
+    if (NATIVE_LAYOUT)
+    {
+        if (BPP < raw_info.bits_per_pixel || !RAW_IS_IDLE)
+        {
+            MENU_SET_VALUE("%d-bit native", BPP);
+            MENU_SET_WARNING(MENU_WARN_ADVICE, "DIGIC 8: EXPERIMENTAL, switches the camera's raw depth while recording.");
+        }
+        else
+        {
+            MENU_SET_VALUE("%d-bit native", raw_info.bits_per_pixel);
+            MENU_SET_WARNING(MENU_WARN_INFO, "DIGIC 8: the camera sends %d-bit in this mode; MLV needs a reader that knows the native layout.", raw_info.bits_per_pixel);
+        }
+        return;
+    }
 
     switch (output_format)
     {
@@ -1298,8 +1991,22 @@ static MENU_UPDATE_FUNC(pre_recording_update)
     }
 }
 
+/* H.264 proxy: off where ML's SRM suite is Canon's movie recorder work
+ * memory (M6II, platform/M6II.111/movrec_mem.c: raw takes use the H.264
+ * encoder's and the movie writer's pools, so Canon's recorder can't run
+ * at the same time; the REC key is also kept from starting it outside
+ * LiveView, see raw_rec_keypress_cbr) */
+extern WEAK_FUNC(ret_0) struct memSuite *movrec_malloc_suite(void);
+#define H264_ENCODER_MEM_TAKEN ((void *) movrec_malloc_suite != (void *) ret_0)
+
 static MENU_UPDATE_FUNC(h264_proxy_update)
 {
+    if (H264_ENCODER_MEM_TAKEN)
+    {
+        MENU_SET_VALUE("OFF");
+        MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Not available: raw recording uses Canon's H.264 encoder memory.");
+        return;
+    }
 
     if (h264_proxy_menu)
     {
@@ -1331,7 +2038,7 @@ static MENU_UPDATE_FUNC(h264_proxy_update)
 
 static inline int use_h264_proxy()
 {
-    if (!h264_proxy_menu)
+    if (!h264_proxy_menu || H264_ENCODER_MEM_TAKEN)
     {
         return 0;
     }
@@ -1458,7 +2165,12 @@ int add_mem_suite(struct memSuite * mem_suite, int chunk_index, int max_frame_si
                 /* (after this number, write speed decreases) */
                 /* (CFDMA can write up to FFFF sectors at once) */
                 /* (FFFE just in case) */
-                if (group_size + max_frame_size > 0xFFFE * 512)
+                /* compressed frames: no split here, so the space they
+                 * leave adds up over the whole chunk into more slots
+                 * (in 32 MB groups of ~3 large slots it never reached a
+                 * whole slot); the writer keeps each write under the
+                 * limit instead (MAX_WRITE_SIZE) */
+                if (!OUTPUT_COMPRESSION && group_size + max_frame_size > MAX_WRITE_SIZE)
                 {
                     /* insert a small gap to split the group here */
                     add_reserved_slots((void*)ptr, group_size / max_frame_size);
@@ -1487,11 +2199,12 @@ void free_buffers()
     configured_pre_recording_settings = 0;
     total_slot_count = 0;
     valid_slot_count = 0;
+    ps_ring = 0;
 
     /* this buffer is allocated from one of the suites -> nothing to do */
     fullsize_buffers[0] = 0;
 
-    if (fullsize_buffers[1] && raw_info.buffer)
+    if (fullsize_buffers[1] && raw_info.buffer && !ps_take)
     {
         ASSERT(fullsize_buffers[1] == UNCACHEABLE(raw_info.buffer));
     }
@@ -1510,6 +2223,9 @@ void free_buffers()
 }
 
 static REQUIRES(settings_sem)
+void take_srm_buffers();
+
+static REQUIRES(settings_sem)
 void realloc_buffers()
 {
     /* reallocate all memory from Canon */
@@ -1520,11 +2236,34 @@ void realloc_buffers()
     /* yes, this may be a bit wasteful, but at least it works */
     /* note: full memory allocation is very slow (1-2 seconds) */
     shoot_mem_suite = shoot_malloc_suite(0);
-    srm_mem_suite = use_srm_memory ? srm_malloc_suite(0) : 0;
     info_led_off();
 
     printf("Shoot memory: %s\n", shoot_mem_suite ? format_memory_size(shoot_mem_suite->size) : "N/A");
+
+    if (!srm_is_movrec_memory())
+    {
+        take_srm_buffers();
+    }
+}
+
+/* SRM memory: taken with the shoot memory, except where it is Canon's movie
+ * recorder work memory (M6II), which Canon's H.264 encoder would need: there
+ * only from REC (srm_malloc_suite in mem.c); free_buffers at the end of the
+ * recording returns it */
+static REQUIRES(settings_sem)
+void take_srm_buffers()
+{
+    if (!use_srm_memory || srm_mem_suite)
+    {
+        return;
+    }
+    srm_mem_suite = srm_malloc_suite(0);
     printf("SRM memory: %s\n", srm_mem_suite ? format_memory_size(srm_mem_suite->size) : "N/A");
+    if (srm_mem_suite)
+    {
+        /* lay the slots out again, over both suites */
+        configured_max_frame_size = 0;
+    }
 }
 
 /* internal memory management - allocate frame slots and fullsize raw buffers
@@ -1563,11 +2302,18 @@ int setup_buffers()
     total_slot_count = 0;
     valid_slot_count = 0;
 
+    static int said_no_suites = 0;
     if (!shoot_mem_suite && !srm_mem_suite)
     {
-        printf("No memory suites.\n");
+        /* called repeatedly while raw video is inactive; say it once */
+        if (!said_no_suites)
+        {
+            printf("No memory suites.\n");
+            said_no_suites = 1;
+        }
         return 0;
     }
+    said_no_suites = 0;
 
     printf("Setting up buffers (frame size %s, ", format_memory_size(max_frame_size));
     printf("fullres size %s)\n", format_memory_size(fullres_buf_size));
@@ -1575,10 +2321,23 @@ int setup_buffers()
     /* discard old full-size buffers */
     fullsize_buffers[0] = fullsize_buffers[1] = 0;
 
-    if (fullres_buf_size > 20 * 1024 * 1024 - 1024 && !OUTPUT_COMPRESSION)
+    if (ps_take)
+    {
+        /* 1:1 takes: frames come from Canon's encoder, not a LiveView
+         * buffer (non-zero, never read) */
+        fullsize_buffers[0] = fullsize_buffers[1] = (void *) ps_pending;
+    }
+    else if (fullres_buf_size > 20 * 1024 * 1024 - 1024 && !OUTPUT_COMPRESSION)
     {
         /* large buffers? assume single-buffering is safe for uncompressed output */
         printf("Using single buffering (check with Show EDMAC).\n");
+        fullsize_buffers[0] = UNCACHEABLE(raw_info.buffer);
+    }
+    else if (!raw_lv_can_redirect())
+    {
+        /* the raw channel always writes Canon's buffer; a second one
+         * would never be filled */
+        printf("Using single buffering (raw channel can't be redirected).\n");
         fullsize_buffers[0] = UNCACHEABLE(raw_info.buffer);
     }
 
@@ -1601,7 +2360,10 @@ int setup_buffers()
     }
 
     /* reuse Canon's buffer */
-    fullsize_buffers[1] = UNCACHEABLE(raw_info.buffer);
+    if (!ps_take)
+    {
+        fullsize_buffers[1] = UNCACHEABLE(raw_info.buffer);
+    }
 
     /* anything wrong? */
     if(fullsize_buffers[0] == 0 || fullsize_buffers[1] == 0)
@@ -1609,6 +2371,20 @@ int setup_buffers()
         /* buffers will be freed by caller in the cleanup section */
         printf("Could not allocate full-size buffers.\n");
         return 0;
+    }
+
+    /* 1:1 takes, and CRX takes without pre-recording (which drops frames
+     * from fixed slots): exact-size frames in a ring */
+    if (ps_take || (OUTPUT_CRX && !pre_record && !rec_trigger))
+    {
+        if (!ps_ring_setup(fullres_buf_size))
+        {
+            return 0;
+        }
+        configured_max_frame_size = max_frame_size;
+        configured_fullres_buf_size = fullres_buf_size;
+        configured_pre_recording_settings = pre_recording_settings;
+        return 1;
     }
 
     /* allocate frame slots from the two memory suites */
@@ -1863,12 +2639,18 @@ static int update_status(char * buffer, int buffer_size)
             /* display in blue */
             return COLOR_BLUE;
         }
+        else if (!RAW_IS_RECORDING)
+        {
+            /* preparing (including the card warm-up), finishing: not
+             * green from the last take's write speed before capture */
+            return COLOR_YELLOW;
+        }
         else if (predicted_frames_left > 10000)
         {
             /* assume continuous recording */
             return COLOR_GREEN1;
         }
-        else if (RAW_IS_RECORDING)
+        else
         {
             if (time_left < 100)
             {
@@ -1877,11 +2659,6 @@ static int update_status(char * buffer, int buffer_size)
 
             /* warning - recording not continuous */
             return (time_left < 10) ? COLOR_DARK_RED : COLOR_ORANGE;
-        }
-        else
-        {
-            /* preparing, finishing */
-            return COLOR_YELLOW;
         }
     } 
     else 
@@ -1897,7 +2674,12 @@ static LVINFO_UPDATE_FUNC(recording_status)
 {
     static int aux = 0;
     static int prev_color = 0;
-    if (!should_run_polling_action(800, &aux))
+    static int prev_state = -1;
+    /* redraw right away when the state changes (yellow to green when
+     * capture starts after the card warm-up) */
+    int state_changed = (raw_recording_state != prev_state);
+    prev_state = raw_recording_state;
+    if (!should_run_polling_action(800, &aux) && !state_changed)
     {
         /* don't update much more often than 1 second */
         item->color_bg = prev_color;
@@ -2020,6 +2802,8 @@ static REQUIRES(ShootTask) EXCLUDES(settings_sem)
 unsigned int raw_rec_polling_cbr(unsigned int unused)
 {
     if (!compress_mq) return 0;
+
+    raw_menu_refresh();
 
     raw_lv_request_update();
 
@@ -2362,6 +3146,26 @@ void free_slot(int slot_index)
 
     int i = slot_index;
 
+    if (ps_ring)
+    {
+        if (i >= ps_ring_first)
+        {
+            /* a ring frame: its space is reused once older ones are written */
+            slots[i].status = SLOT_RESERVED;
+            slots[i].ptr = 0;
+            slots[i].size = 0;
+        }
+        else
+        {
+            /* an audio slot (mlv_rec_release_slot may have trimmed it) */
+            slots[i].status = SLOT_FREE;
+            slots[i].size = PS_AUDIO_SLOT_SIZE;
+            slots[i].is_meta = 0;
+        }
+        sei(old_int);
+        return;
+    }
+
     slots[i].status = SLOT_RESERVED;
     valid_slot_count--;
 
@@ -2698,6 +3502,69 @@ static void edmac_cbr_w(void *ctx)
     edmac_copy_rectangle_adv_cleanup();
 }
 
+/* compressed frame (CRX): fit the slot to it, as the LJ92 path does */
+static void crx_check_compressed_size(int slot_index, int compressed_size)
+{
+    if (compressed_size <= 0)
+    {
+        /* no frame: write an empty VIDF (readers skip it) rather than a
+         * full-size slot of stale data, which the writer asserts on */
+        if (!RAW_IS_IDLE)
+        {
+            shrink_slot(slot_index, 0);
+            frame_fake_edmac_check(slot_index);
+        }
+        return;
+    }
+    if (compressed_size > max_frame_size - VIDF_HDR_SIZE - 4)
+    {
+        printf("Compressed size too high - too much detail or noise?\n");
+        buffer_full = 1;
+        return;
+    }
+    if (!RAW_IS_IDLE)
+    {
+        shrink_slot(slot_index, compressed_size);
+    }
+    frame_fake_edmac_check(slot_index);
+    measured_compression_ratio = (compressed_size/128) * 100 / (frame_size_uncompressed/128);
+}
+
+/* 1:1 takes: MLV_REC_EVENT_STARTED at the first frame, as process_frame
+ * sends it, but from a task of its own: mlv_snd opens Canon's sound input
+ * there (~230 ms), and on the compress task that held up the copies until
+ * the slots ran out */
+static void ps_started_task()
+{
+    mlv_rec_call_cbr(MLV_REC_EVENT_STARTED, NULL);
+    ps_sound_t0 = get_us_clock();
+}
+
+/* Canon's CR3 encoder reads the crop straight from the LV buffer, any
+ * pitch: from a 4-byte aligned address (8 px at 12-bit, 16 px at 10/14-bit)
+ * plus a pixel offset, so the crop starts where the other formats' does.
+ * No EDMAC copy.  Returns the compressed size (< 0: error); x / y0: where
+ * the crop starts. */
+static int crx_encode_crop(void *fullSizeBuffer, void *out, int out_max, int *x_out, int *y0_out, int *enc_us, int *copy_us)
+{
+    static int crx_w, crx_h, crx_bpp, crx_pitch, crx_lossy = -1;
+    int pitch_px = raw_info.pitch * 8 / BPP;
+    int lossy = (crx_compress == 2);
+    if (crx_w != res_x || crx_h != res_y || crx_bpp != BPP || crx_pitch != pitch_px || crx_lossy != lossy)
+    {
+        crx_enc_setup(res_x, res_y, BPP, pitch_px, lossy);
+        crx_w = res_x; crx_h = res_y; crx_bpp = BPP; crx_pitch = pitch_px; crx_lossy = lossy;
+    }
+    int unit = 32 / (BPP & -BPP);
+    int x = (skip_x + 7) & ~7;
+    int x0 = x - x % unit;
+    int y0 = CROP_Y0;
+    *x_out = x;
+    *y0_out = y0;
+    void * src = fullSizeBuffer + y0 * raw_info.pitch + x0 * BPP / 8;
+    return crx_enc_frame(src, x - x0, out, out_max, enc_us, copy_us);
+}
+
 static void compress_task()
 {
     ASSERT(compress_mq == 0);
@@ -2723,6 +3590,7 @@ static void compress_task()
                 edmac_memcpy_res_lock();
                 printf("EDMAC copy resources locked.\n");
             }
+            crx_sum_enc_us = crx_sum_copy_us = crx_max_us = crx_frames = 0;
 
             edmac_start_spy();
 
@@ -2739,9 +3607,32 @@ static void compress_task()
                 edmac_memcpy_res_unlock();
                 printf("EDMAC copy resources unlocked.\n");
             }
+            if (crx_frames)
+            {
+                printf("CRX: %d frames, encode %d us, copy %d us avg, max %d us\n",
+                    crx_frames, crx_sum_enc_us / crx_frames, crx_sum_copy_us / crx_frames, crx_max_us);
+            }
 
             edmac_stop_spy();
+            compress_stopped = 1;
 
+            continue;
+        }
+
+        if (msg == CRX_MEASURE_MSG)
+        {
+            /* warm-up of a CRX take: encode the current LiveView frame
+             * into the ring's start (unused until recording starts) for
+             * its size only */
+            int x, y0, enc_us, copy_us;
+            int size = crx_encode_crop(UNCACHEABLE(raw_info.buffer), ps_ring_reg[0].base + VIDF_HDR_SIZE,
+                                       max_frame_size - VIDF_HDR_SIZE - 4 - 512 - 16, &x, &y0, &enc_us, &copy_us);
+            if (size > 0)
+            {
+                ps_meas_size[ps_meas_n % PS_MEAS_FRAMES] = (VIDF_HDR_SIZE + ((size + 3) & ~3) + 8 + 511) & ~511;
+                ps_meas_n++;
+            }
+            crx_measure_pending = 0;
             continue;
         }
 
@@ -2760,7 +3651,100 @@ static void compress_task()
 
         edmac_start_clock = GET_DIGIC_TIMER();
 
-        if (OUTPUT_COMPRESSION)
+        if (ps_take)
+        {
+            /* 1:1 source: Canon's encoder made the frame; ps_frame_take
+             * put its header in the slot, the parts follow it (the
+             * frames come in order, so the oldest pending one is ours) */
+            struct ps_frame *f = &ps_pending[ps_pend_head % PS_PENDING];
+            ASSERT(f->slot == slot_index);
+
+            uint64_t t = get_us_clock();
+            int data = crx_copy_parts((uint8_t *) out_ptr + f->hdr_size, f->n, f->addr, f->size);
+            int copy_us = get_us_clock() - t;
+            if (ps_movie)
+            {
+                preshoot_movie_release(f->handle);
+            }
+            int compressed_size = f->hdr_size + data;
+            ps_pend_head++;
+            crx_last_copy_us = copy_us;
+            if (!RAW_IS_IDLE)
+            {
+                crx_sum_copy_us += copy_us;
+                crx_max_us = MAX(crx_max_us, copy_us);
+                crx_frames++;
+                tl_add('E', slots[slot_index].frame_number, compressed_size, copy_us);
+            }
+            if (ps_ring)
+            {
+                /* the slot was sized for this frame */
+                if (compressed_size != slots[slot_index].payload_size)
+                {
+                    printf("1:1: frame %d is %d bytes, slot for %d\n", slots[slot_index].frame_number,
+                           compressed_size, slots[slot_index].payload_size);
+                }
+                frame_fake_edmac_check(slot_index);
+                measured_compression_ratio = (compressed_size / 128) * 100 / (frame_size_uncompressed / 128);
+            }
+            else
+            {
+                crx_check_compressed_size(slot_index, compressed_size);
+            }
+        }
+        else if (OUTPUT_CRX)
+        {
+            int x = 0, y0 = 0, enc_us = 0, copy_us = 0;
+            /* ring slots need room for the frame check after the data */
+            int out_max = max_frame_size - VIDF_HDR_SIZE - 4 - (ps_ring ? 512 + 16 : 0);
+            int compressed_size = crx_encode_crop(fullSizeBuffer, out_ptr, out_max, &x, &y0, &enc_us, &copy_us);
+            ((mlv_vidf_hdr_t *) slots[slot_index].ptr)->cropPosX = x;
+            ((mlv_vidf_hdr_t *) slots[slot_index].ptr)->cropPosY = y0;
+            crx_last_enc_us = enc_us;
+            crx_last_copy_us = copy_us;
+            if (!RAW_IS_IDLE)
+            {
+                crx_sum_enc_us += enc_us;
+                crx_sum_copy_us += copy_us;
+                crx_max_us = MAX(crx_max_us, enc_us + copy_us);
+                crx_frames++;
+            }
+            /* one failed frame becomes an empty VIDF (readers skip it);
+             * stop only if the encoder keeps failing */
+            static int crx_errors_in_row = 0;
+            if (compressed_size < 0 && !RAW_IS_IDLE)
+            {
+                crx_errors_in_row++;
+                printf("CRX error %d at frame %d (%d in a row)\n", compressed_size, frame_count-1, crx_errors_in_row);
+                if (crx_errors_in_row >= 5)
+                {
+                    buffer_full = 1;
+                }
+            }
+            else if (compressed_size > 0)
+            {
+                crx_errors_in_row = 0;
+            }
+            if (!RAW_IS_IDLE)
+            {
+                tl_add('E', slots[slot_index].frame_number, compressed_size, enc_us + copy_us);
+            }
+            if (ps_ring)
+            {
+                /* an empty VIDF if it failed (readers skip it) */
+                ps_ring_shrink(slot_index, compressed_size);
+                frame_fake_edmac_check(slot_index);
+                if (compressed_size > 0)
+                {
+                    measured_compression_ratio = (compressed_size / 128) * 100 / (frame_size_uncompressed / 128);
+                }
+            }
+            else
+            {
+                crx_check_compressed_size(slot_index, compressed_size);
+            }
+        }
+        else if (OUTPUT_COMPRESSION)
         {
             /* PackMem appears to require stricter memory alignment */
             ASSERT(((uint32_t)out_ptr & 0x3F) == 0);
@@ -2770,7 +3754,7 @@ static void compress_task()
 
             int compressed_size = lossless_compress_raw_rectangle(
                 outSuite, fullSizeBuffer,
-                raw_info.width, (skip_x + 7) & ~7, skip_y & ~1,
+                raw_info.width, (skip_x + 7) & ~7, CROP_Y0,
                 res_x, res_y
             );
 
@@ -2820,13 +3804,22 @@ static void compress_task()
         else
         {
             edmac_active = 1;
-            edmac_copy_rectangle_cbr_start(
+            void * copied = edmac_copy_rectangle_cbr_start(
                 (void*)out_ptr, fullSizeBuffer,
-                raw_info.pitch, (skip_x + 7)/8*BPP, skip_y/2*2,
+                raw_info.pitch, (skip_x + 7)/8*BPP, CROP_Y0,
                 res_x * BPP/8, 0, 0,
                 res_x * BPP/8, res_y,
                 &edmac_cbr_r, &edmac_cbr_w, NULL
             );
+            if (!copied)
+            {
+                /* the copy didn't start (or timed out), so its CBR won't
+                 * clear edmac_active; stop cleanly instead of reporting
+                 * "EDMAC timeout" on every frame */
+                printf("EDMAC copy failed (%d x %d, %d bytes/row)\n", res_x, res_y, res_x * BPP/8);
+                edmac_active = 0;
+                buffer_full = 1;
+            }
         }
         
         /* mark it as completed */
@@ -2867,8 +3860,20 @@ void process_frame(int next_fullsize_buffer_pos)
     
     pre_record_vsync_step();
     
-    /* where to save the next frame? */
-    capture_slot = choose_next_capture_slot(capture_slot);
+    /* where to save the next frame? (CRX ring: worst case now, shrunk to
+     * the frame once encoded) */
+    if (ps_ring)
+    {
+        capture_slot = ps_ring_alloc(max_frame_size);
+        if (capture_slot >= 0)
+        {
+            slots[capture_slot].payload_size = max_frame_size - VIDF_HDR_SIZE - 4;
+        }
+    }
+    else
+    {
+        capture_slot = choose_next_capture_slot(capture_slot);
+    }
 
     if (capture_slot < 0 && raw_recording_state == RAW_PRE_RECORDING)
     {
@@ -2889,6 +3894,7 @@ void process_frame(int next_fullsize_buffer_pos)
         slots[capture_slot].frame_number = frame_count;
         slots[capture_slot].status = SLOT_CAPTURING;
         frame_add_checks(capture_slot);
+        tl_add('C', frame_count, capture_slot, count_free_slots());
 
         if (raw_recording_state == RAW_PRE_RECORDING)
         {
@@ -2906,6 +3912,7 @@ void process_frame(int next_fullsize_buffer_pos)
     else
     {
         /* card too slow */
+        tl_add('F', frame_count, 0, 0);
         buffer_full = 1;
         return;
     }
@@ -2913,8 +3920,9 @@ void process_frame(int next_fullsize_buffer_pos)
     /* set VIDF metadata for this frame */
     vidf_hdr.frameNumber = slots[capture_slot].frame_number - 1;
     mlv_set_timestamp((mlv_hdr_t*)&vidf_hdr, mlv_start_timestamp);
+    vfit_add(vidf_hdr.timestamp);
     vidf_hdr.cropPosX = (skip_x + 7) & ~7;
-    vidf_hdr.cropPosY = skip_y & ~1;
+    vidf_hdr.cropPosY = CROP_Y0;
     vidf_hdr.panPosX = skip_x;
     vidf_hdr.panPosY = skip_y;
     *(mlv_vidf_hdr_t*)(slots[capture_slot].ptr) = vidf_hdr;
@@ -2933,6 +3941,137 @@ void process_frame(int next_fullsize_buffer_pos)
     return;
 }
 
+/* 1:1 source: a frame Canon finished encoding (AlgsMgr's task, before
+ * Canon's own callback; handle as for crx_copy_parts).  Does what
+ * process_frame does for a LiveView frame; the parts are copied by the
+ * compress task, but Canon's sample header lives in a heap buffer Canon
+ * reuses soon: that one is copied here. */
+static NO_THREAD_SAFETY_ANALYSIS
+int ps_frame_take(uint32_t handle)
+{
+    if (ps_measuring)
+    {
+        /* before recording: only the size (as a slot), then discarded */
+        uint32_t n = MEM(handle + 0x18), sizes = MEM(handle + 0x20), total = 0;
+        if (n >= 2 && n <= PS_PARTS && sizes)
+        {
+            for (uint32_t i = 0; i < n; i++)
+            {
+                total += MEM(sizes + 4 * i);
+            }
+            ps_meas_size[ps_meas_n % PS_MEAS_FRAMES] = (VIDF_HDR_SIZE + ((total + 3) & ~3) + 8 + 511) & ~511;
+            ps_meas_n++;
+        }
+        return 0;
+    }
+    if (!ps_take || raw_recording_state != RAW_RECORDING || buffer_full)
+    {
+        return 0;
+    }
+    /* the first frame starts the sound (STARTED, off this task); frames
+     * captured before it runs are dropped (see PS_ENC_LATENCY_US) */
+    if (!ps_started_cbr)
+    {
+        ps_started_cbr = 1;
+        task_create("ps_started", 0x1a, 0x1000, ps_started_task, 0);
+    }
+    uint64_t captured = get_us_clock() - PS_ENC_LATENCY_US;
+    if (!ps_sound_t0 || captured < ps_sound_t0)
+    {
+        return 0;
+    }
+    uint32_t n = MEM(handle + 0x18), addrs = MEM(handle + 0x1C), sizes = MEM(handle + 0x20);
+    if (n < 2 || n > PS_PARTS || !addrs || !sizes)
+    {
+        printf("1:1: unreadable result (handle %x, %d parts)\n", handle, n);
+        return 0;
+    }
+    uint32_t hsz = MEM(sizes), total = 0;
+    for (uint32_t i = 0; i < n; i++)
+    {
+        total += MEM(sizes + 4 * i);
+    }
+    if ((int) total > max_frame_size - VIDF_HDR_SIZE - 4 || hsz > 4096)
+    {
+        printf("1:1: frame of %d bytes doesn't fit (%d)\n", total, max_frame_size);
+        buffer_full = 1;
+        return 0;
+    }
+    if (ps_pend_tail - ps_pend_head >= PS_PENDING)
+    {
+        /* the copies fell behind */
+        tl_add('F', frame_count, 1, 0);
+        buffer_full = 1;
+        return 0;
+    }
+
+    /* no LiveView frame to skip: the first one is a real frame */
+    if (frame_count <= 0)
+    {
+        frame_count = 1;
+    }
+
+    /* exact size, with room for the frame checks' word after the data */
+    int slot_size = (VIDF_HDR_SIZE + ((total + 3) & ~3) + 8 + 511) & ~511;
+    if (slot_size >= max_frame_size)
+    {
+        printf("1:1: frame of %d bytes doesn't fit (%d)\n", total, max_frame_size);
+        buffer_full = 1;
+        return 0;
+    }
+    capture_slot = ps_ring_alloc(slot_size);
+    if (capture_slot < 0)
+    {
+        /* card too slow */
+        tl_add('F', frame_count, 0, 0);
+        buffer_full = 1;
+        return 0;
+    }
+    slots[capture_slot].payload_size = total;
+    slots[capture_slot].frame_number = frame_count;
+    slots[capture_slot].status = SLOT_CAPTURING;
+    frame_add_checks(capture_slot);
+    tl_add('C', frame_count, capture_slot, count_free_slots());
+    if (frame_count % 24 == 1)
+    {
+        /* why ML's overlays (cropmarks too) don't redraw during the take */
+        tl_add('D', liveview_display_idle_why(), RECORDING, lv);
+    }
+    writing_queue[writing_queue_tail] = capture_slot;
+    INC_MOD(writing_queue_tail, COUNT(writing_queue));
+
+    vidf_hdr.frameNumber = slots[capture_slot].frame_number - 1;
+    mlv_set_timestamp((mlv_hdr_t*)&vidf_hdr, mlv_start_timestamp);
+    if (vidf_hdr.timestamp > PS_ENC_LATENCY_US)
+    {
+        vidf_hdr.timestamp -= PS_ENC_LATENCY_US;
+    }
+    vfit_add(vidf_hdr.timestamp);
+    vidf_hdr.cropPosX = PS_X0;
+    vidf_hdr.cropPosY = PS_Y0;
+    vidf_hdr.panPosX = PS_X0;
+    vidf_hdr.panPosY = PS_Y0;
+    *(mlv_vidf_hdr_t*)(slots[capture_slot].ptr) = vidf_hdr;
+    ((mlv_vidf_hdr_t*)(slots[capture_slot].ptr))->blockSize = slots[capture_slot].size;
+
+    struct ps_frame *f = &ps_pending[ps_pend_tail % PS_PENDING];
+    f->slot = capture_slot;
+    f->n = n;
+    f->hdr_size = hsz;
+    for (uint32_t i = 0; i < n; i++)
+    {
+        f->addr[i] = MEM(addrs + 4 * i);
+        f->size[i] = MEM(sizes + 4 * i);
+    }
+    memcpy(slots[capture_slot].ptr + VIDF_HDR_SIZE, (void *) f->addr[0], hsz);
+    ps_pend_tail++;
+
+    f->handle = handle;
+    msg_queue_post(compress_mq, capture_slot);
+    frame_count++;
+    return 1;
+}
+
 static REQUIRES(LiveViewTask)
 unsigned int FAST raw_rec_vsync_cbr(unsigned int unused)
 {
@@ -2940,10 +4079,31 @@ unsigned int FAST raw_rec_vsync_cbr(unsigned int unused)
     if (!compress_mq) return 0;
     if (!is_movie_mode()) return 0;
 
+    /* 1:1 movie take: our own encode of the frame in EDMAC ch 1 (core
+     * preshoot.c); no LiveView raw, no double buffering */
+    if (ps_take)
+    {
+        /* also before recording, while the card warms up: those frames
+         * are measured for the rate the take needs (ps_measuring) */
+        if ((RAW_IS_RECORDING || ps_measuring) && !buffer_full)
+        {
+            preshoot_movie_frame();
+        }
+        return 0;
+    }
+
     hack_liveview_vsync();
  
     /* panning window is updated when recording, but also when not recording */
     panning_update();
+
+    /* CRX ring take warming up: one frame at a time to the encoder, for
+     * the rate the take needs */
+    if (ps_measuring && ps_ring && !crx_measure_pending)
+    {
+        crx_measure_pending = 1;
+        msg_queue_post(compress_mq, CRX_MEASURE_MSG);
+    }
 
     if (!RAW_IS_RECORDING) return 0;
     if (!raw_lv_settings_still_valid()) { raw_recording_state = RAW_FINISHING; return 0; }
@@ -2978,6 +4138,7 @@ unsigned int FAST raw_rec_vsync_setparam_cbr(unsigned int unused)
 
     return CBR_RET_CONTINUE;
 }
+
 
 static const char* get_cf_dcim_dir()
 {
@@ -3066,6 +4227,7 @@ static REQUIRES(RawRecTask)
 void init_mlv_chunk_headers(struct raw_info *raw_info)
 {
     mlv_start_timestamp = mlv_set_timestamp(NULL, 0);
+    vfit_reset(ps_take ? ps_fps : fps_get_current_x1000());
     if (raw_info == NULL)
         return;
     
@@ -3079,7 +4241,8 @@ void init_mlv_chunk_headers(struct raw_info *raw_info)
         file_hdr[i].fileCount = 0; //autodetect
         file_hdr[i].fileFlags = 4;
         file_hdr[i].videoClass = MLV_VIDEO_CLASS_RAW |
-            (OUTPUT_COMPRESSION ? MLV_VIDEO_CLASS_FLAG_LJ92 : 0);
+            (OUTPUT_CRX ? MLV_VIDEO_CLASS_FLAG_CRX :
+             OUTPUT_COMPRESSION ? MLV_VIDEO_CLASS_FLAG_LJ92 : 0);
         file_hdr[i].audioClass = 0;
         file_hdr[i].videoFrameCount = 0; //autodetect
         file_hdr[i].audioFrameCount = 0;
@@ -3120,15 +4283,27 @@ void init_mlv_chunk_headers(struct raw_info *raw_info)
     rawi_hdr.raw_info.bits_per_pixel = BPP;
     rawi_hdr.raw_info.pitch = rawi_hdr.raw_info.width * BPP / 8;
 
-    /* scale black and white levels, minimizing the roundoff error */
-    int black14 = rawi_hdr.raw_info.black_level;
-    int white14 = rawi_hdr.raw_info.white_level;
-    int bpp_scaling = (1 << (14 - BPP));
-    rawi_hdr.raw_info.black_level = (black14 + bpp_scaling/2) / bpp_scaling;
-    rawi_hdr.raw_info.white_level = (white14 + bpp_scaling/2) / bpp_scaling;
+    /* scale black and white levels, minimizing the roundoff error
+     * (D8 native: raw_info levels are already at the stream's bit depth) */
+    if (!NATIVE_LAYOUT)
+    {
+        int black14 = rawi_hdr.raw_info.black_level;
+        int white14 = rawi_hdr.raw_info.white_level;
+        int bpp_scaling = (1 << (14 - BPP));
+        rawi_hdr.raw_info.black_level = (black14 + bpp_scaling/2) / bpp_scaling;
+        rawi_hdr.raw_info.white_level = MIN((white14 + bpp_scaling/2) / bpp_scaling, (1 << BPP) - 1);
+    }
 
     mlv_fill_idnt(&idnt_hdr, mlv_start_timestamp);
     mlv_fill_expo(&expo_hdr, mlv_start_timestamp);
+    if (is_camera("M6II", "1.1.1") && !ps_take && expo_hdr.isoAnalog)
+    {
+        /* M6II movie takes record Mem1's HEAD tap, before Canon's digital
+         * ISO gain (third stops, auto ISO's 1/8 steps): the data's ISO is
+         * the analog whole stop.  Canon's split stays in isoAnalog /
+         * digitalGain */
+        expo_hdr.isoValue = raw2iso(expo_hdr.isoAnalog);
+    }
     mlv_fill_lens(&lens_hdr, mlv_start_timestamp);
     mlv_fill_rtci(&rtci_hdr, mlv_start_timestamp);
     mlv_fill_wbal(&wbal_hdr, mlv_start_timestamp);
@@ -3196,8 +4371,146 @@ int write_mlv_chunk_headers(FILE *f, int chunk, int card_index)
     return padded_size;
 }
 
+/* Debug: write a one-frame MLV with the usual headers, the frame copied by
+ * the CPU straight from Canon's LV raw buffer (may tear; it's still being
+ * written).  Needs neither frame buffers nor EDMAC copies, so the metadata
+ * (MLVI/RAWI/RAWC/IDNT/EXPO/LENS/RTCI/WBAL/VERS) can be checked end to end
+ * in mlv_dump / MLV App on models where recording doesn't work yet. */
+static void mlv_test_clip_task()
+{
+    if (!lv || !is_movie_mode() || !RAW_IS_IDLE)
+    {
+        NotifyBox(3000, "Test MLV: movie mode, not recording");
+        return;
+    }
+
+    raw_lv_request();
+    wait_lv_frames(3);
+    raw_set_dirty();
+    if (!raw_update_params())
+    {
+        NotifyBox(3000, "Test MLV: raw detect error");
+        raw_lv_release();
+        return;
+    }
+
+    take_semaphore(settings_sem, 0);
+    update_resolution_params();
+    update_cropping_offsets();
+    give_semaphore(settings_sem);
+
+    init_mlv_chunk_headers(&raw_info);
+    file_hdr[0].videoFrameCount = 1;
+
+    char *filename = get_next_raw_movie_file_name();
+    FILE *f = filename ? FIO_CreateFile(filename) : NULL;
+    if (!f)
+    {
+        NotifyBox(3000, "Test MLV: file create error");
+        raw_lv_release();
+        return;
+    }
+
+    int ok = write_mlv_chunk_headers(f, 0, 0) > 0;
+
+    /* rows of res_x pixels from (skip_x, skip_y); skip_x in whole 8-pixel
+     * groups, which start on a byte boundary in either bit layout */
+    int row_bytes = res_x * BPP / 8;
+    int x0_bytes = (skip_x / 8) * BPP;
+    int y0 = CROP_Y0;
+
+    mlv_vidf_hdr_t vidf;
+    memset(&vidf, 0, sizeof(vidf));
+    mlv_set_type((mlv_hdr_t *)&vidf, "VIDF");
+    mlv_set_timestamp((mlv_hdr_t *)&vidf, mlv_start_timestamp);
+    vidf.blockSize = sizeof(vidf) + row_bytes * res_y;
+    vidf.cropPosX = (skip_x / 8) * 8;
+    vidf.cropPosY = y0;
+    vidf.panPosX = skip_x;
+    vidf.panPosY = skip_y;
+    ok &= FIO_WriteFile(f, &vidf, sizeof(vidf)) == sizeof(vidf);
+
+    /* copy in chunks of rows through a small buffer */
+    int rows_per_chunk = MAX(1, 65536 / row_bytes);
+    uint8_t *chunk = malloc(rows_per_chunk * row_bytes);
+    /* as raw.c gives it; no CACHEABLE() here, modules are built without
+     * the platform's memory layout */
+    uint8_t *src = (uint8_t *)raw_info.buffer;
+    if (!chunk || !src)
+    {
+        ok = 0;
+    }
+    for (int y = 0; ok && y < res_y; y += rows_per_chunk)
+    {
+        int n = MIN(rows_per_chunk, res_y - y);
+        for (int r = 0; r < n; r++)
+        {
+            memcpy(chunk + r * row_bytes,
+                   src + (y0 + y + r) * raw_info.pitch + x0_bytes, row_bytes);
+        }
+        ok &= FIO_WriteFile(f, chunk, n * row_bytes) == n * row_bytes;
+    }
+    if (chunk)
+        free(chunk);
+    FIO_CloseFile(f);
+    raw_lv_release();
+
+    printf("Test MLV %s: %dx%d %d-bit, %s\n", filename, res_x, res_y, BPP, ok ? "OK" : "write error");
+    NotifyBox(5000, "Test MLV: %s\n%dx%d %d-bit %s", filename, res_x, res_y, BPP, ok ? "" : "(write error)");
+}
+
 static GUARDED_BY(RawRecTask) int file_size_limit = 0;         /* have we run into the 4GB limit? */
 static GUARDED_BY(RawRecTask) int mlv_chunk = 0;               /* MLV chunk index from header */
+
+/* the take's results, for the take log */
+static double vfit_video_fps = 0, vfit_audio_hz = 0;
+static uint32_t vfit_meta = 0;
+
+/* end of a take, before the last chunk is closed: the measured frame rate
+ * into every chunk's header (earlier chunks are already closed: patched) */
+static REQUIRES(RawRecTask)
+void vfit_finish(void)
+{
+    /* only where the core's frame rate is itself measured; elsewhere
+     * the header keeps the camera's nominal rate */
+    vfit_meta = fps_is_measured() ? vfit_meta_fps(&vfit_video_fps, &vfit_audio_hz) : 0;
+    if (!vfit_meta)
+    {
+        return;
+    }
+    for (int i = 0; i < CARD_COUNT; i++)
+    {
+        file_hdr[i].sourceFpsNom = vfit_meta;
+        file_hdr[i].sourceFpsDenom = FPS_META_DENOM;
+    }
+    for (int chunk = 0; chunk < mlv_chunk; chunk++)
+    {
+        char name[FIO_MAX_PATH_LENGTH];
+        if (chunk == 0)
+        {
+            snprintf(name, sizeof(name), "%s", raw_movie_filename);
+        }
+        else
+        {
+            get_next_chunk_file_name(raw_movie_filename, chunk, name, 0);
+        }
+        FILE *g = FIO_OpenFile(name, O_RDWR);
+        if (!g)
+        {
+            printf("fps: can't reopen %s\n", name);
+            continue;
+        }
+        mlv_file_hdr_t h;
+        if (FIO_ReadFile(g, &h, sizeof(h)) == sizeof(h) && !memcmp(h.fileMagic, "MLVI", 4))
+        {
+            h.sourceFpsNom = vfit_meta;
+            h.sourceFpsDenom = FPS_META_DENOM;
+            FIO_SeekSkipFile(g, 0, SEEK_SET);
+            FIO_WriteFile(g, &h, sizeof(h));
+        }
+        FIO_CloseFile(g);
+    }
+}
 
 /* update the frame count and close the chunk */
 static REQUIRES(RawRecTask)
@@ -3210,7 +4523,8 @@ void finish_chunk(FILE *f, int card_index)
     
     FIO_SeekSkipFile(f, 0, SEEK_SET);
     FIO_WriteFile(f, &file_hdr[card_index], file_hdr[card_index].blockSize);
-    FIO_CloseFile(f);
+    /* chunk_filename is still this chunk's name */
+    FIO_CloseFileSC(f, chunk_filename[card_index]);
     chunk_frame_count[card_index] = 0;
 }
 
@@ -3230,7 +4544,7 @@ int write_frames(FILE **pf, void *ptr, int group_size, int num_frames, int card_
 
         printf("About to reach 4GB limit.\n");
         printf("Creating new chunk: %s\n", chunk_filename[card_index]);
-        FILE* g = FIO_CreateFile(chunk_filename[card_index]);
+        FILE* g = FIO_CreateFileSC(chunk_filename[card_index]);
 
         if (!g)
             return 0;
@@ -3247,7 +4561,7 @@ int write_frames(FILE **pf, void *ptr, int group_size, int num_frames, int card_
         else
         {
             printf("New chunk didn't work. Card full?\n");
-            FIO_CloseFile(g);
+            FIO_CloseFileSC(g, chunk_filename[card_index]);
             FIO_RemoveFile(chunk_filename[card_index]);
             mlv_chunk--;
             return 0;
@@ -3295,7 +4609,7 @@ int write_frames(FILE **pf, void *ptr, int group_size, int num_frames, int card_
         /* try to create a new chunk */
         get_next_chunk_file_name(raw_movie_filename, ++mlv_chunk, chunk_filename[card_index], card_index);
         printf("Creating new chunk: %s\n", chunk_filename[card_index]);
-        FILE *g = FIO_CreateFile(chunk_filename[card_index]);
+        FILE *g = FIO_CreateFileSC(chunk_filename[card_index]);
         if (!g) return 0;
         
         file_hdr[card_index].fileNum = mlv_chunk;
@@ -3314,7 +4628,7 @@ int write_frames(FILE **pf, void *ptr, int group_size, int num_frames, int card_
         else /* new chunk didn't work, card full */
         {
             printf("New chunk didn't work. Card full?\n");
-            FIO_CloseFile(g);
+            FIO_CloseFileSC(g, chunk_filename[card_index]);
             FIO_RemoveFile(chunk_filename[card_index]);
             mlv_chunk--;
             return 0;
@@ -3331,6 +4645,19 @@ int write_frames(FILE **pf, void *ptr, int group_size, int num_frames, int card_
     return 1;
 }
 
+/* drop whatever is left in the writing queue.  A take that aborts after
+ * STARTING skips the final flush, while mlv_snd's stop still queues its
+ * audio slots; those entries outlived the take, and the next take's
+ * writer waited on the first of them (a freed slot, never SLOT_FULL)
+ * while its own frames filled the buffer: a take with nothing written. */
+static NO_THREAD_SAFETY_ANALYSIS
+void writing_queue_reset()
+{
+    uint32_t old_int = cli();
+    writing_queue_head = writing_queue_tail;
+    sei(old_int);
+}
+
 extern thunk ErrCardForLVApp_handler;
 
 /* note: called from raw_video_rec_task */
@@ -3345,7 +4672,324 @@ void init_vsync_vars()
     skipped_frames = 0;
 }
 
+/* with "Take log" on, written for every take to ML/LOGS/<clip name>.LOG, to compare takes
+ * that stop early with ones that don't (the console keeps only its
+ * tail); %s, not %c: ML's printf repeats a %c character across the line */
+static void tl_print(int early_stop, int named)
+{
+    int size = 64 * (TL_EVENTS + 4);
+    char *buf = fio_malloc(size);
+    if (!buf)
+    {
+        printf("Start timeline: no memory\n");
+        return;
+    }
+    int len = snprintf(buf, size,
+        "Start timeline (ms from REC; P warm-up bytes ms [1:1: need kB/s], R state, C frame slot free, E frame bytes us, W frames bytes, w ms, F frame, D overlay blockers (zebra.c bits) RECORDING lv)\n"
+        "%s%s; slots %d valid %d, frame %d, shoot %d, SRM %d; sensor %d C at REC, %d C now\n",
+        (named && raw_movie_filename) ? raw_movie_filename : "no file (failed start)", early_stop ? ", early stop" : "",
+        total_slot_count, valid_slot_count, max_frame_size,
+        shoot_mem_suite ? shoot_mem_suite->size : 0,
+        srm_mem_suite ? srm_mem_suite->size : 0,
+        SENSOR_CELSIUS(tl_temp0), SENSOR_CELSIUS(efic_temp));
+    if (ps_movie)
+    {
+        /* a skipped frame leaves a gap in time, not in frame numbers */
+        int started = 0, skipped = 0, failed = 0, wrong_depth = 0, resets = 0;
+        preshoot_movie_stats(&started, &skipped, &failed, &wrong_depth, &resets);
+        len += snprintf(buf + len, size - len, "1:1 movie, %d-bit: %d encodes started, %d frames skipped (encoder busy), "
+                        "%d failed, %d dropped (written at another depth), %d depth resets by Canon\n",
+                        ps_bits, started, skipped, failed, wrong_depth, resets);
+        int v[14];
+        int n = preshoot_movie_race(v);
+        if (n)
+        {
+            /* the crop is rows PS_Y0 .. PS_Y0 + PS_H of the full frame */
+            len += snprintf(buf + len, size - len, "ch 1 writer row (min/mean/max, crop rows %d..%d) over %d frames: "
+                            "vsync %d/%d/%d, after encode start %d/%d/%d, encode end %d/%d/%d; "
+                            "encode %d us max, %d us mean\n", PS_Y0, PS_Y0 + PS_H, n,
+                            v[0], v[1], v[2], v[6], v[7], v[8], v[9], v[10], v[11], v[12], v[13]);
+        }
+    }
+    if (vfit_meta)
+    {
+        len += snprintf(buf + len, size - len, "fps metadata %d/%d: video %d.%06d fps +-%d ppm over %d frames, audio %d.%03d Hz +-%d ppm (nominal %d)%s\n",
+                        (int) vfit_meta, FPS_META_DENOM,
+                        (int) vfit_video_fps, (int) ((vfit_video_fps - (int) vfit_video_fps) * (double) 1000000),
+                        rate_fit_err_ppm(&vfit), (int) vfit.n,
+                        (int) vfit_audio_hz, (int) ((vfit_audio_hz - (int) vfit_audio_hz) * (double) 1000),
+                        vfit_audio_err_ppm, vfit_audio_nominal,
+                        vfit_audio_hz <= 0 ? ", no sound" :
+                        vfit_meta != (uint32_t) (vfit_video_fps * FPS_META_DENOM + (double) 0.5)
+                            ? ", fps relative to the audio clock" : ", audio clock too uncertain: video rate");
+    }
+    for (int i = 0; i < tl_n && len < size - 64; i++)
+    {
+        char type[2] = { tl[i].type, 0 };
+        len += snprintf(buf + len, size - len, "%d %s %d %d %d\n",
+                        tl[i].ms, type, tl[i].a, tl[i].b, tl[i].c);
+    }
+    /* B:/DCIM/100CANON/Mdd-hhmm.MLV -> ML/LOGS/Mdd-hhmm.LOG */
+    char name[32] = "ML/LOGS/MLV_TL.LOG";
+    int n = (named && raw_movie_filename) ? strlen(raw_movie_filename) : 0;
+    if (n > 13 && raw_movie_filename[n - 13] == '/')
+    {
+        /* no %.8s: ML's snprintf doesn't take a precision */
+        memcpy(name + 8, raw_movie_filename + n - 12, 8);
+        strcpy(name + 16, ".LOG");
+    }
+    FILE *f = FIO_CreateFile(name);
+    if (f)
+    {
+        FIO_WriteFile(f, buf, len);
+        FIO_CloseFile(f);
+    }
+    printf("Start timeline: %d events in %s\n", tl_n, name);
+    fio_free(buf);
+}
+
+/* Some cards write slowly for the first second or so of a file (M6II,
+ * V90 UHS-II card in speed class mode: 23-30 MB/s for the first 7-40 MB,
+ * then ~200 MB/s, at random), which fills the
+ * buffer before the card gets going.  Before the first frame, write MLV
+ * NULL blocks (readers skip them) until one goes at the rate the take
+ * needs, for at most START_WARMUP_MS.  Returns the bytes written, -1 on
+ * a write error. */
+#define START_WARMUP_MS 5000
+/* 1:1 takes (ps_warmup): the slow start once lasted a whole 5 s warm-up
+ * (~20 MB/s); recording starts only when the card keeps up, so a longer
+ * limit costs nothing but waiting */
+#define PS_WARMUP_MS    15000
+static REQUIRES(RawRecTask)
+int write_start_warmup(FILE *f, int fps)
+{
+    if (!start_warmup)
+    {
+        return 0;
+    }
+
+    /* any free slot: nothing is captured yet */
+    void *buf = NULL;
+    for (int i = 0; i < total_slot_count; i++)
+    {
+        if (slots[i].status == SLOT_FREE && slots[i].size >= 1024 * 1024)
+        {
+            buf = slots[i].ptr;
+            break;
+        }
+    }
+    if (!buf)
+    {
+        return 0;
+    }
+    /* small blocks: a card that starts fast pays one or two */
+    int block = MIN(max_frame_size, 4 * 1024 * 1024) & ~511;
+
+    /* out of the slow start: half the take's data rate (compressed
+     * frames ~3/4 of a slot).  Not the full rate: a card slower than the
+     * take would pad for the whole START_WARMUP_MS (seen: 8 MB blocks at
+     * ~130 MB/s for 175 MB/s takes), while the slow start is ~25 MB/s */
+    int frame = OUTPUT_COMPRESSION ? max_frame_size / 4 * 3 : max_frame_size;
+    int need_kbs = (frame / 1024) * (fps / 100) / 10 / 2;
+
+    int total = 0;
+    int t0 = get_ms_clock();
+    int max_ms = ps_take ? PS_WARMUP_MS : START_WARMUP_MS;
+    int fast = 0;
+    while (get_ms_clock() - t0 < max_ms)
+    {
+        mlv_hdr_t hdr;
+        memset(&hdr, 0, sizeof(hdr));
+        mlv_set_type(&hdr, "NULL");
+        hdr.blockSize = block;
+        memcpy(buf, &hdr, sizeof(hdr));
+
+        int t = get_ms_clock();
+        if (FIO_WriteFile(f, buf, block) != block)
+        {
+            return -1;
+        }
+        int ms = MAX(get_ms_clock() - t, 1);
+        total += block;
+        tl_add('P', block, ms, 0);
+        if ((block / 1024) * 1000 / ms >= need_kbs)
+        {
+            fast = 1;
+            break;
+        }
+    }
+    printf("Warm-up: %d MB in %d ms, %s\n", total >> 20, get_ms_clock() - t0,
+           fast ? "card up to speed" : "card still slow");
+    return total;
+}
+
+/* 1:1 takes: the data rate measured from frames encoded so far (kB/s at
+ * fps x1000), 0 until there are enough */
+static int ps_need_kbs(int fps)
+{
+    int n = MIN(ps_meas_n, PS_MEAS_FRAMES);
+    if (n < 6)
+    {
+        return 0;
+    }
+    uint32_t sum = 0;
+    for (int i = 0; i < n; i++)
+    {
+        sum += ps_meas_size[i];
+    }
+    return (sum / n / 1024) * (fps / 10) / 100;
+}
+
+/* Warm the card up until it writes at the take's rate plus 10%, averaged
+ * over the last PS_READY_WINDOW blocks (one fast block isn't enough: the
+ * card falls back into slow spells); give up after max_ms.  The rate:
+ * fixed_kbs if known (uncompressed: frame size x fps), else measured from
+ * the 1:1 frames encoded meanwhile; if that is still unknown at the limit
+ * (the 1:1 mode slow to start), the take starts anyway.  buf: block bytes
+ * nobody uses yet.  Returns the bytes written, -1 on a write error, -2 if
+ * the card didn't keep up (need / card in kB/s). */
+#define PS_READY_MS         5000
+#define PS_READY_WINDOW     4
+static REQUIRES(RawRecTask)
+int warmup_to_rate(FILE *f, void *buf, int block, int fixed_kbs, int fps, int max_ms, int *need, int *card)
+{
+    int win_ms[PS_READY_WINDOW] = { 0 };
+    int total = 0, n = 0;
+    int t0 = get_ms_clock();
+    *need = *card = 0;
+    while (get_ms_clock() - t0 < max_ms)
+    {
+        mlv_hdr_t hdr;
+        memset(&hdr, 0, sizeof(hdr));
+        mlv_set_type(&hdr, "NULL");
+        hdr.blockSize = block;
+        memcpy(buf, &hdr, sizeof(hdr));
+
+        int t = get_ms_clock();
+        if (FIO_WriteFile(f, buf, block) != block)
+        {
+            return -1;
+        }
+        int ms = MAX(get_ms_clock() - t, 1);
+        total += block;
+        win_ms[n++ % PS_READY_WINDOW] = ms;
+
+        int sum_ms = 0;
+        for (int i = 0; i < MIN(n, PS_READY_WINDOW); i++)
+        {
+            sum_ms += win_ms[i];
+        }
+        *card = (block / 1024) * MIN(n, PS_READY_WINDOW) * 1000 / sum_ms;
+        *need = fixed_kbs ? fixed_kbs : ps_need_kbs(fps);
+        tl_add('P', block, ms, *need);
+        /* Start warm-up: 1 = the exact rate, 2 = 10% above it */
+        int margin = (start_warmup == 2) ? 10 : 0;
+        if (*need && n >= PS_READY_WINDOW && *card >= *need / 100 * (100 + margin))
+        {
+            printf("Warm-up: %d MB in %d ms, card %d MB/s for %d MB/s\n", total >> 20,
+                   get_ms_clock() - t0, *card / 1024, *need / 1024);
+            return total;
+        }
+    }
+    if (!*need)
+    {
+        printf("Warm-up: %d MB, card %d MB/s, take's rate not measured yet: started\n", total >> 20, *card / 1024);
+        return total;
+    }
+    printf("Warm-up: card %d MB/s, take needs %d MB/s: not started\n", *card / 1024, *need / 1024);
+    return -2;
+}
+
+/* 1:1 takes: the ring's start is free until recording starts */
+static REQUIRES(RawRecTask)
+int ps_warmup(FILE *f, int fps, int *need, int *card)
+{
+    if (!start_warmup)
+    {
+        return 0;
+    }
+    int block = MIN(4 * 1024 * 1024, (int) ps_ring_reg[0].size) & ~511;
+    return warmup_to_rate(f, ps_ring_reg[0].base, block, 0, fps, PS_WARMUP_MS, need, card);
+}
+
+/* 1:1 source: fixed geometry (Canon's 1:1 frame cut by the core) */
+static struct raw_info ps_raw_info;
+
+static NO_THREAD_SAFETY_ANALYSIS
+void ps_set_resolution()
+{
+    res_x = PS_W;
+    res_y = PS_H;
+    frame_size_uncompressed = PS_W * PS_H * ps_bits / 8;
+    max_frame_size = PS_MAX_FRAME;
+
+    /* colour matrix etc from the camera's raw_info; LiveView's geometry
+     * doesn't apply */
+    ps_raw_info = raw_info;
+    ps_raw_info.buffer = 0;
+    ps_raw_info.width = PS_W;
+    ps_raw_info.height = PS_H;
+    /* the EDMAC pack unit drops low bits: 14-bit levels >> (14 - bits).
+     * The 1:1 data includes Canon's digital ISO gain (manual ISO, static
+     * scene, signal over black relative to ISO 200: 250 = 200 + 3/8 stop
+     * 1.29x, 320 = 400 - 3/8 1.64x, 400 2.06x).  So a manual ISO pulled
+     * from the stop above (160, 320, 640...) scales the analog data down
+     * and shouldn't get past black + range x 2^(gain/8): used as its white
+     * level (expected, not measured).  Not for auto ISO (the gain changes
+     * within the take) */
+    int white14 = 16380;
+    if (lens_info.raw_iso && lens_info.iso_digital_ev < 0)
+    {
+        float f = 1.0f;
+        for (int i = 0; i < -lens_info.iso_digital_ev; i++)
+        {
+            f *= 0.91700404f;       /* 2^(-1/8) */
+        }
+        white14 = 2048 + (int) ((16380 - 2048) * f);
+    }
+    ps_raw_info.pitch = PS_W * ps_bits / 8;
+    ps_raw_info.frame_size = frame_size_uncompressed;
+    ps_raw_info.bits_per_pixel = ps_bits;
+    ps_raw_info.black_level = 2048 >> (14 - ps_bits);
+    ps_raw_info.white_level = white14 >> (14 - ps_bits);
+    ps_raw_info.jpeg.x = 0;
+    ps_raw_info.jpeg.y = 0;
+    ps_raw_info.jpeg.width = PS_W;
+    ps_raw_info.jpeg.height = PS_H;
+    ps_raw_info.active_area.y1 = 0;
+    ps_raw_info.active_area.x1 = 0;
+    ps_raw_info.active_area.y2 = PS_H;
+    ps_raw_info.active_area.x2 = PS_W;
+    ps_raw_info.cfa_pattern = 0x02010100;
+}
+
+/* after init_mlv_chunk_headers: what LiveView's state put there differently */
+static NO_THREAD_SAFETY_ANALYSIS
+void ps_fix_headers()
+{
+    rawi_hdr.raw_info.bits_per_pixel = ps_bits;
+    rawi_hdr.raw_info.pitch = PS_W * ps_bits / 8;
+    /* init_mlv_chunk_headers sets these from LiveView's raw stream; the
+     * 1:1 frame's are ps_raw_info's */
+    rawi_hdr.raw_info.black_level = ps_raw_info.black_level;
+    rawi_hdr.raw_info.white_level = ps_raw_info.white_level;
+    rawc_hdr.binning_x = rawc_hdr.binning_y = 1;
+    rawc_hdr.skipping_x = rawc_hdr.skipping_y = 0;
+    rawc_hdr.offset_x = PS_X0;
+    rawc_hdr.offset_y = PS_Y0;
+    for (int i = 0; i < CARD_COUNT; i++)
+    {
+        file_hdr[i].videoClass |= MLV_VIDEO_CLASS_FLAG_CRX_FULL | (ps_lossless ? MLV_VIDEO_CLASS_FLAG_CRX_ENC0 : 0);
+        file_hdr[i].sourceFpsNom = ps_fps;
+        file_hdr[i].sourceFpsDenom = 1000;
+    }
+}
+
 static REQUIRES(RawRecTask) EXCLUDES(settings_sem)
+/* a take that doesn't get going: say why on screen, in the console and
+ * the take log (a failed start leaves no clip to look at) */
+#define REC_FAIL(...) do { NotifyBox(5000, __VA_ARGS__); printf("Take failed: "); printf(__VA_ARGS__); printf("\n"); tl_add('X', 0, 0, 0); } while (0)
+
 void raw_video_rec_task(uint32_t card_index)
 {
     //~ console_show();
@@ -3358,6 +5002,9 @@ void raw_video_rec_task(uint32_t card_index)
     int fps = 1;
 
     written_total[card_index] = 0; /* in bytes */
+    /* raw_movie_filename is still the last take's until this one names its
+     * file: a take that fails before that must not delete it */
+    raw_movie_file_created = 0;
     writing_time[card_index] = 0;
     idle_time[card_index] = 0;
     measured_write_speeds[card_index] = 0;
@@ -3370,9 +5017,50 @@ void raw_video_rec_task(uint32_t card_index)
         // (they won't start in RAW_PREPARING, but we might catch them running)
         take_semaphore(settings_sem, 0);
         raw_recording_state = RAW_PREPARING;
+        writing_queue_reset();
         give_semaphore(settings_sem);
 
         mlv_rec_call_cbr(MLV_REC_EVENT_PREPARING, NULL);
+
+        ps_movie = MOVIE_1TO1_SOURCE;
+        printf("Take preparing (%s)\n", ps_movie ? "1:1" : one_to_one ? "1:1 set, not in movie mode" : "LiveView raw");
+        if (RECORDING_H264)
+        {
+            /* Canon records a movie: its recorder memory and encoder are
+             * in use (ps_take is still 0: nothing to undo) */
+            REC_FAIL("Canon is recording a movie");
+            goto cleanup;
+        }
+        if (!is_movie_mode())
+        {
+            /* raw video is for movie mode only (ps_take is 0 here) */
+            REC_FAIL("Raw video: movie mode only");
+            goto cleanup;
+        }
+        ps_take = ps_movie;
+        if (ps_take)
+        {
+            ps_cfg_on();
+            ps_bits = bpp_container[output_format];
+            ps_lossless = crx_compress == 1;
+            ps_w = ps_next_w;
+            ps_h = ps_next_h;
+            ps_x0 = ps_next_x0;
+            ps_y0 = ps_next_y0;
+        }
+        if (ps_take)
+        {
+            /* before Canon's 1:1 mode starts: it takes the timing then */
+            ps_fps = preshoot_set_23976(ps_cfg.fps_24p);
+        }
+        ps_pend_head = ps_pend_tail = 0;
+        ps_started_cbr = 0;
+        ps_sound_t0 = 0;
+        ps_canon_started = 0;
+        if (ps_take)
+        {
+            printf("1:1 source: %dx%d from (%d, %d)\n", PS_W, PS_H, PS_X0, PS_Y0);
+        }
 
         /* globals - updated by vsync hook */
         NO_THREAD_SAFETY_CALL(init_vsync_vars)();
@@ -3384,7 +5072,7 @@ void raw_video_rec_task(uint32_t card_index)
         mlv_chunk = 0;
         buffer_full = 0;
 
-        if (lv_dispsize == 10)
+        if (lv_dispsize == 10 && !ps_take)
         {
             /* assume x10 is for focusing */
             /* todo: detect x5 preset in crop_rec? */
@@ -3413,22 +5101,102 @@ void raw_video_rec_task(uint32_t card_index)
 
         /* disable Canon's powersaving (30 min in LiveView) */
         powersave_prohibit();
+
+        /* DIGIC 8: switch the camera's layout and depth first, so the raw
+         * parameters detected below (and BPP) describe what it will send */
+        int hw_depth = NATIVE_LAYOUT;
+        if (hw_depth && !ps_take && !OUTPUT_CRX)
+        {
+            raw_lv_request_layout(RAW_LAYOUT_ML);
+            raw_set_dirty();
+            wait_lv_frames(2);
+            raw_update_params();
+        }
+        if (hw_depth && !ps_take)
+        {
+            take_semaphore(settings_sem, 0);
+            setup_bit_depth();
+            give_semaphore(settings_sem);
+        }
+
         /* wait for two frames to be sure everything is refreshed */
         wait_lv_frames(2);
 
-        /* detect raw parameters (geometry, black level etc) */
+        /* detect raw parameters (geometry, black level etc); the 1:1
+         * source doesn't use LiveView's raw stream */
         raw_set_dirty();
-        if (!raw_update_params())
+        if (!ps_take && !raw_update_params())
         {
-            NotifyBox(5000, "Raw detect error");
+            REC_FAIL( "Raw detect error");
             goto cleanup;
+        }
+
+        if (NATIVE_LAYOUT && !OUTPUT_CRX)
+        {
+            /* uncompressed / LJ92 frames are recorded in ML's layout only
+             * (no reader handles the LSB-first one) */
+            REC_FAIL( "Camera didn't switch to ML's raw layout\nTry again");
+            goto cleanup;
+        }
+
+        if (OUTPUT_CRX && !ps_take && !crx_enc_ready())
+        {
+            /* don't fall back to uncompressed without saying so */
+            REC_FAIL( "CRX encoder not ready\nTry again, or turn Compression off");
+            goto cleanup;
+        }
+
+        if (NATIVE_LAYOUT && !ps_take && raw_info.bits_per_pixel != MIN(bpp_container[output_format], raw_info.bits_per_pixel))
+        {
+            /* asked for less than the camera kept; record what it sends */
+            printf("Camera kept %d-bit\n", raw_info.bits_per_pixel);
         }
 
         take_semaphore(settings_sem, 0);
         update_resolution_params();
+        if (ps_take)
+        {
+            ps_set_resolution();
+        }
+        if (!shoot_mem_suite)
+        {
+            /* given back at the end of the last take; the retry below
+             * would not run, as the SRM suite alone gives some slots */
+            realloc_buffers();
+        }
+        take_srm_buffers();
         setup_buffers();
-        setup_bit_depth();
+        if (valid_slot_count == 0)
+        {
+            /* the memory we took earlier may be stale or small: it is only
+             * taken again on a state change, and Canon may have been holding
+             * memory at that time (seen after USB / PC-connect on M6II) */
+            printf("No frame buffers (shoot memory %s, SRM %s), retrying\n",
+                shoot_mem_suite ? format_memory_size(shoot_mem_suite->size) : "N/A",
+                srm_mem_suite ? format_memory_size(srm_mem_suite->size) : "N/A");
+            realloc_buffers();
+            take_srm_buffers();
+            setup_buffers();
+        }
+        /* (1:1 takes: Canon's encoder gets the sensor data from ch 1, not
+         * LiveView's raw stream; the core sets ch 1's depth per frame) */
+        if (!hw_depth && !ps_take)
+        {
+            setup_bit_depth();
+        }
+        int no_buffers = (valid_slot_count == 0);
         give_semaphore(settings_sem);
+
+        if (no_buffers)
+        {
+            /* nothing to capture into; previously this ran on and
+             * reported "EDMAC timeout" on the first frame */
+            REC_FAIL( "Raw video: no memory for frame buffers");
+            printf("No frame buffers (shoot memory %s, SRM %s)\n",
+                shoot_mem_suite ? format_memory_size(shoot_mem_suite->size) : "N/A",
+                srm_mem_suite ? format_memory_size(srm_mem_suite->size) : "N/A");
+            goto cleanup;
+        }
 
         /* create output file */
         raw_movie_filename = get_next_raw_movie_file_name();
@@ -3437,25 +5205,35 @@ void raw_video_rec_task(uint32_t card_index)
             goto cleanup;
         }
         strcpy(chunk_filename[card_index], raw_movie_filename);
-        f = FIO_CreateFile(raw_movie_filename);
+        /* speed class recording, as Canon's movie writer: without it
+         * the card could take a second or more to reach its speed */
+        f = FIO_CreateFileSC(raw_movie_filename);
         if (!f)
         {
-            NotifyBox(5000, "File create error");
+            REC_FAIL( "File create error");
             goto cleanup;
         }
+        raw_movie_file_created = 1;
 
         /* Need to start the recording of audio before the init of the mlv chunk */
         mlv_rec_call_cbr(MLV_REC_EVENT_STARTING, NULL);
 
-        init_mlv_chunk_headers(&raw_info);
+        init_mlv_chunk_headers(ps_take ? &ps_raw_info : &raw_info);
+        if (ps_take)
+        {
+            ps_fix_headers();
+        }
         written_total[card_index] = written_chunk[card_index] = write_mlv_chunk_headers(f, mlv_chunk, card_index);
         if (!written_chunk[card_index])
         {
-            NotifyBox(5000, "Card Full");
+            REC_FAIL( "Card Full");
             goto cleanup;
         }
-        hack_liveview(0);
-        liveview_hacked = 1;
+        if (!ps_take)
+        {
+            hack_liveview(0);
+            liveview_hacked = 1;
+        }
 
         /* try a sync beep (not very precise, but better than nothing) */
         if(sync_beep)
@@ -3463,9 +5241,84 @@ void raw_video_rec_task(uint32_t card_index)
             beep();
         }
 
-        fps = fps_get_current_x1000();
+        fps = ps_take ? ps_fps : fps_get_current_x1000();
         if (fps == 0)
             goto cleanup;
+
+        if (ps_take)
+        {
+            /* Canon's 1:1 mode now: its frames are encoded (and measured,
+             * not recorded) while the card warms up */
+            ps_meas_n = 0;
+            ps_measuring = 1;
+            preshoot_movie_set_lossless(ps_lossless);
+            if (preshoot_movie_enable(PS_X0, PS_W, PS_Y0, PS_H, ps_bits, ps_frame_take) != 0)
+            {
+                REC_FAIL( "1:1 source unavailable");
+                goto cleanup;
+            }
+            if (preshoot_mode_start() != 0)
+            {
+                REC_FAIL( "Couldn't start the 1:1 mode");
+                goto cleanup;
+            }
+            ps_canon_started = 1;
+            printf("1:1 mode started\n");
+        }
+
+        int need_kbs = 0, card_kbs = 0;
+        int warmup_bytes;
+        if (ps_take)
+        {
+            warmup_bytes = ps_warmup(f, fps, &need_kbs, &card_kbs);
+        }
+        else if (ps_ring && start_warmup)
+        {
+            /* CRX ring take: frames encoded meanwhile give the rate (the
+             * ring's start is their scratch space, the warm-up block
+             * follows it) */
+            ps_meas_n = 0;
+            crx_measure_pending = 0;
+            ps_measuring = 1;
+            int block = 4 * 1024 * 1024;
+            void *buf = ((int) ps_ring_reg[0].size >= max_frame_size + block) ? ps_ring_reg[0].base + max_frame_size
+                      : (ps_ring_nreg > 1 && (int) ps_ring_reg[1].size >= block) ? ps_ring_reg[1].base : NULL;
+            warmup_bytes = buf ? warmup_to_rate(f, buf, block, 0, fps, PS_READY_MS, &need_kbs, &card_kbs) : write_start_warmup(f, fps);
+        }
+        else if (!OUTPUT_COMPRESSION && start_warmup && valid_slot_count > 0)
+        {
+            /* uncompressed: every frame is a whole slot, the rate is known */
+            void *buf = NULL;
+            for (int i = 0; i < total_slot_count && !buf; i++)
+            {
+                if (slots[i].status == SLOT_FREE)
+                {
+                    buf = slots[i].ptr;
+                }
+            }
+            int block = MIN(max_frame_size, 4 * 1024 * 1024) & ~511;
+            int rate = (max_frame_size / 1024) * (fps / 10) / 100;
+            warmup_bytes = buf ? warmup_to_rate(f, buf, block, rate, fps, PS_READY_MS, &need_kbs, &card_kbs) : 0;
+        }
+        else
+        {
+            warmup_bytes = write_start_warmup(f, fps);
+        }
+        if (warmup_bytes == -2)
+        {
+            NotifyBox(8000, "Card too slow for this take:\nneeds %d MB/s, wrote %d MB/s", need_kbs / 1024, card_kbs / 1024);
+            printf("Take failed: card too slow, needs %d MB/s, wrote %d MB/s\n", need_kbs / 1024, card_kbs / 1024);
+            /* nothing but headers and padding: the file goes */
+            written_total[card_index] = 0;
+            goto cleanup;
+        }
+        if (warmup_bytes < 0)
+        {
+            NotifyBox(5000, "Card Full");
+            goto cleanup;
+        }
+        written_total[card_index] += warmup_bytes;
+        written_chunk[card_index] += warmup_bytes;
 
         /* signal start of recording to the compression task */
         // FIXME SJE let's not use INT_MAX as a signal with meaning,
@@ -3475,8 +5328,19 @@ void raw_video_rec_task(uint32_t card_index)
         /* fake recording status, to integrate with other ml stuff (e.g. hdr video */
         set_recording_custom(CUSTOM_RECORDING_RAW);
 
+        /* measured warm-ups end here (1:1 frames until now were only
+         * measured); a CRX measurement still running uses the ring's
+         * start, where recording begins */
+        ps_measuring = 0;
+        for (int t = 0; t < 2000 && crx_measure_pending; t += 10)
+        {
+            msleep(10);
+        }
+
         /* this will enable the vsync CBR and the other task(s) */
-        raw_recording_state = pre_record ? RAW_PRE_RECORDING : RAW_RECORDING;
+        tl_add('R', 0, 0, 0);
+        raw_recording_state = (pre_record && !ps_take) ? RAW_PRE_RECORDING : RAW_RECORDING;
+
     }
     else if (card_index == 1)
     {
@@ -3486,7 +5350,7 @@ void raw_video_rec_task(uint32_t card_index)
             msleep(10);
         }
         get_next_chunk_file_name(raw_movie_filename, ++mlv_chunk, chunk_filename[card_index], card_index);
-        f = FIO_CreateFile(chunk_filename[card_index]);
+        f = FIO_CreateFileSC(chunk_filename[card_index]);
         if (!f)
         {
             NotifyBox(5000, "File create error");
@@ -3496,9 +5360,17 @@ void raw_video_rec_task(uint32_t card_index)
     }
 
 
-    /* main recording loop */
-    while (RAW_IS_RECORDING && lv)
+    /* main recording loop; a 1:1 take rides out short LiveView gaps (a
+     * half-press restarts LiveView in the 1:1 mode; takes used to stop
+     * there, with no frame) */
+    int ps_lv_lost = 0;
+    while (RAW_IS_RECORDING && (lv || (ps_take && get_ms_clock() - ps_lv_lost < PS_LV_GAP_MS)))
     {
+        if (ps_take && lv)
+        {
+            ps_lv_lost = get_ms_clock();
+        }
+
         if (buffer_full)
         {
             goto abort_and_check_early_stop;
@@ -3604,7 +5476,8 @@ void raw_video_rec_task(uint32_t card_index)
 
             /* TBH, I don't care if these are part of the same group or not,
              * as long as pointers are ordered correctly */
-            if (slots[slot_index].ptr == slots[first_slot].ptr + group_size)
+            if (slots[slot_index].ptr == slots[first_slot].ptr + group_size &&
+                (i == w_head || group_size + slots[slot_index].size <= MAX_WRITE_SIZE))
             {
                 last_grouped = i;
             }
@@ -3687,12 +5560,14 @@ void raw_video_rec_task(uint32_t card_index)
         idle_time[card_index] += t0 - last_write_timestamp;
 
         /* save a group of frames and measure execution time */
+        tl_add('W', num_frames - meta_slots, group_size, 0);
         if (!write_frames(&f, ptr, group_size, num_frames - meta_slots, card_index))
         {
             goto abort;
         }
         
         last_write_timestamp = get_ms_clock();
+        tl_add('w', last_write_timestamp - t0, 0, 0);
         writing_time[card_index] += last_write_timestamp - t0;
 
         /* for detecting early stops */
@@ -3764,8 +5639,9 @@ abort:
             last_block_size = 0; /* ignore early stop check */
 
 abort_and_check_early_stop:
+            tl_early_stop = 1;
 
-            if (!RECORDING_H264 && card_index == 0)
+            if (!RECORDING_H264 && card_index == 0 && !ps_take)
             {
                 /* faster writing speed that way */
                 PauseLiveView();
@@ -3796,16 +5672,48 @@ abort_and_check_early_stop:
     /* done, this will stop the vsync CBR and the copying task */
     raw_recording_state = RAW_FINISHING;
     mlv_rec_call_cbr(MLV_REC_EVENT_STOPPING, NULL);
+    if (ps_take)
+    {
+        /* after STOPPING (mlv_snd finishes its last chunk there): no new
+         * encodes; the one running ends before the mode does */
+        preshoot_movie_disable();
+        if (ps_canon_started)
+        {
+            preshoot_mode_stop();
+            ps_canon_started = 0;
+        }
+    }
 
     /* wait until the other tasks calm down */
     wait_lv_frames(2);
 
-    /* signal end of recording to the compression task */
+    /* signal end of recording to the compression task, and let it finish
+     * the frames queued before the stop (slow encodes can leave a backlog:
+     * flushing those slots early tripped asserts on both sides) */
+    compress_stopped = 0;
     msg_queue_post(compress_mq, INT_MIN);
+    for (int i = 0; i < 500 && !compress_stopped; i++)
+    {
+        msleep(20);
+    }
+    if (!compress_stopped)
+    {
+        printf("Compression still busy after 10 s\n");
+    }
+    else if (ps_movie)
+    {
+        /* 1:1 movie take: frames whose parts were never copied still hold
+         * the encoder's buffers */
+        while (ps_pend_head != ps_pend_tail)
+        {
+            preshoot_movie_release(ps_pending[ps_pend_head % PS_PENDING].handle);
+            ps_pend_head++;
+        }
+    }
 
     set_recording_custom(CUSTOM_RECORDING_NOT_RECORDING);
 
-    if (!RECORDING_H264 && card_index == 0)
+    if (!RECORDING_H264 && card_index == 0 && !ps_take)
     {
         /* faster writing speed that way */
         PauseLiveView();
@@ -3906,6 +5814,9 @@ abort_and_check_early_stop:
             }
             free_slot(slot_index);
         }
+
+        /* Canon doesn't redraw over our messages on every camera (M6II) */
+        bmp_fill(COLOR_EMPTY, 0, 110, 720, fontspec_height(FONT_MED));
     }
 
     if (!written_total[card_index] || !f)
@@ -3915,12 +5826,23 @@ abort_and_check_early_stop:
         );
         beep_times(3);
         msleep(2000);
+        bmp_fill(COLOR_EMPTY, 0, 110, 720, fontspec_height(FONT_MED));
     }
 
 cleanup:
     if (f)
+    {
+        vfit_finish();
         finish_chunk(f, card_index);
+    }
+    if (take_log && card_index == 0)
+    {
+        /* a take without a file (failed start) goes to MLV_TL.LOG, not
+         * over the previous clip's log */
+        tl_print(tl_early_stop, raw_movie_file_created);
+    }
     if (!written_total[card_index]
+        && raw_movie_file_created
         && raw_movie_filename != NULL)
     {
         FIO_RemoveFile(raw_movie_filename);
@@ -3929,10 +5851,55 @@ cleanup:
 
     if (card_index == 0) // avoid cleaning up twice on dual slot cams
     {
+        ps_measuring = 0;
+        /* DIGIC 8: frames where Canon reprogrammed the raw channel were
+         * written at its depth; read before restore_bit_depth resets it */
+        int bpp_reverts = NATIVE_LAYOUT ? raw_lv_get_bpp_reverts() : 0;
+
+        /* a 1:1 take sends STARTED from a task of its own (mlv_snd opens
+         * Canon's sound input there, ~230 ms): let it finish, or sound
+         * could start after the stop below */
+        for (int i = 0; i < 100 && ps_started_cbr && !ps_sound_t0; i++)
+        {
+            msleep(20);
+        }
+
+        if (ps_take)
+        {
+            preshoot_movie_disable();
+            if (ps_canon_started)
+            {
+                preshoot_mode_stop();
+                ps_canon_started = 0;
+            }
+        }
+        else
+        {
+            /* CRX takes (and their warm-up measurement): Canon's encoders
+             * back to Canon's own set-up, for its next CR3 still */
+            crx_enc_done();
+        }
+
+        /* before the frame slots go back to Canon: a take that aborted
+         * after STARTING never sent STOPPING, and mlv_snd then stops its
+         * input and flushes its audio slots (in those frame slots) on
+         * STOPPED.  After a normal stop it does nothing here. */
+        mlv_rec_call_cbr(MLV_REC_EVENT_STOPPED, NULL);
+
         take_semaphore(settings_sem, 0);
         free_buffers();
-        restore_bit_depth();
+        if (!ps_take)
+        {
+            restore_bit_depth();
+        }
         give_semaphore(settings_sem);
+        /* the slots are gone: so are any entries an aborted take left */
+        writing_queue_reset();
+
+        if (bpp_reverts)
+        {
+            NotifyBox(5000, "Camera reset bit depth %d times,\nsome frames may be corrupt", bpp_reverts);
+        }
 
         /* everything saved, we can unlock the buttons */
         gui_uilock(UILOCK_NONE);
@@ -3955,10 +5922,27 @@ cleanup:
             printf("H.264 stopped.\n");
         }
 
-        ResumeLiveView();
+        if (!ps_take)
+        {
+            ResumeLiveView();
+        }
         redraw();
+        ps_take = 0;
+        ps_movie = 0;
+        ps_lossless = 0;
         raw_recording_state = RAW_IDLE;
-        mlv_rec_call_cbr(MLV_REC_EVENT_STOPPED, NULL);
+
+        if (photo_take)
+        {
+            /* the take started with REC in photo mode: photo LiveView again,
+             * once the take's GUI lock has gone and LiveView has settled */
+            photo_take = 0;
+            msleep(1000);
+            if (!lv_set_movie_mode(0))
+            {
+                NotifyBox(5000, "Couldn't switch back to photo mode:\nturn the mode dial");
+            }
+        }
     }
 }
 
@@ -3974,6 +5958,10 @@ void raw_start_stop()
     else
     {
         printf("Starting raw recording...\n");
+        tl_t0 = get_ms_clock();
+        tl_n = 0;
+        tl_temp0 = efic_temp;
+        tl_early_stop = 0;
         /* raw_rec_task will change state to RAW_PREPARING */
         gui_stop_menu();
         task_create("raw_rec_task1", 0x19, 0x1200, raw_video_rec_task, (void*)0);
@@ -4009,6 +5997,60 @@ static MENU_UPDATE_FUNC(raw_playback_update)
         MENU_SET_VALUE(raw_movie_filename + 17);
     else
         MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Record a video clip first.");
+}
+
+/* Lossy source (M6II): what DEFOE / HEAD mean for this take */
+static MENU_UPDATE_FUNC(lossy_src_update)
+{
+    if (!is_camera("M6II", "1.1.1"))
+    {
+        MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "M6II only.");
+        return;
+    }
+    if (one_to_one && LOSSY_SRC_HEAD)
+    {
+        MENU_SET_WARNING(MENU_WARN_ADVICE, "1:1 takes: HEAD isn't available in the 1:1 mode, DEFOE is used.");
+    }
+    else if (!one_to_one && !LOSSY_SRC_HEAD)
+    {
+        MENU_SET_WARNING(MENU_WARN_ADVICE, "Ordinary takes record HEAD (DEFOE not done yet).");
+    }
+}
+
+/* menu items found by their variable (raw_video_menu's indices move) */
+static struct menu_entry *raw_menu_children = NULL;     /* set at init */
+
+static struct menu_entry *raw_menu_item(void *priv)
+{
+    for (struct menu_entry *e = raw_menu_children; e && !MENU_IS_EOL(e); e++)
+    {
+        if (e->priv == priv)
+        {
+            return e;
+        }
+    }
+    return NULL;
+}
+
+static void raw_menu_hide(void *priv, int hide)
+{
+    struct menu_entry *e = raw_menu_item(priv);
+    if (e)
+    {
+        e->shidden = hide;
+    }
+}
+
+/* 1:1 takes (preshoot.h) use Resolution, Aspect ratio, Data format and
+ * Compression too; their source is always DEFOE (no full-size HEAD in the
+ * 1:1 mode) */
+static void raw_menu_refresh(void)
+{
+    raw_menu_hide(&lossy_src, one_to_one || !is_camera("M6II", "1.1.1"));
+    if (!crx_enc_available())
+    {
+        raw_menu_hide(&crx_compress, 1);
+    }
 }
 
 static struct menu_entry raw_video_menu[] =
@@ -4058,6 +6100,24 @@ static struct menu_entry raw_video_menu[] =
                               "14-bit compressed with Canon's Lossless JPEG. Recommended ISO < 100.\n"
                               "Signal divided by 4 before compression. Recommended ISO 100-1600.\n"
                               "Signal divided by 8/16/32/64 before compression, depending on ISO.\n"
+            },
+            {
+                .name       = "Compression",
+                .priv       = &crx_compress,
+                .max        = 2,
+                .update     = crx_compress_update,
+                .choices    = CHOICES("OFF", "CRX lossless", "CRX lossy (C-RAW)"),
+                .help       = "DIGIC 8: Canon's CR3 encoder. Lossless: bit-exact, ~1.5:1. Lossy: C-RAW.",
+                .help2      = "EXPERIMENTAL. MLV readers need CRX support (flag 0x400).",
+            },
+            {
+                .name       = "Lossy source",
+                .priv       = &lossy_src,
+                .max        = 1,
+                .update     = lossy_src_update,
+                .choices    = CHOICES("DEFOE", "HEAD"),
+                .help       = "M6II, C-RAW takes: DEFOE = after Canon's gain and defect map; HEAD = before.",
+                .help2      = "1:1 takes: DEFOE only (the 1:1 mode has no full-size HEAD). Hot pixels: fix in post.",
             },
             {
                 .name = "Preview",
@@ -4124,6 +6184,23 @@ static struct menu_entry raw_video_menu[] =
                 .advanced = 1,
             },
             {
+                .name = "Start warm-up",
+                .priv = &start_warmup,
+                .max = 2,
+                .choices = CHOICES("OFF", "exact", "+10%"),
+                .help  = "Before the first frame, write padding until the card keeps up with the take's",
+                .help2 = "rate (or 10% above it); not within 5 s: no take. CRX / 1:1: rate measured first.",
+                .advanced = 1,
+            },
+            {
+                .name = "Take log",
+                .priv = &take_log,
+                .max = 1,
+                .help  = "Write ML/LOGS/<clip>.LOG for every take: timing of its first seconds,",
+                .help2 = "memory, frame rate fit (for takes that stop early).",
+                .advanced = 1,
+            },
+            {
                 .name = "Use SRM memory",
                 .priv = &use_srm_memory,
                 .max = 1,
@@ -4162,6 +6239,15 @@ static struct menu_entry raw_video_menu[] =
                 .advanced = 1,
             },
             {
+                .name   = "Write 1-frame test MLV",
+                .select = run_in_separate_task,
+                .priv   = mlv_test_clip_task,
+                .icon_type = IT_ACTION,
+                .help   = "Writes one LV raw frame with all MLV headers (no recording).",
+                .help2  = "For checking metadata in mlv_dump / MLV App. Frame may tear.",
+                .advanced = 1,
+            },
+            {
                 .name = "Playback",
                 .select = raw_playback_start,
                 .update = raw_playback_update,
@@ -4175,22 +6261,92 @@ static struct menu_entry raw_video_menu[] =
 };
 
 
+/* REC in photo mode with raw video on: Canon's REC is blocked, LiveView
+ * switches to movie mode (as Canon's REC does, without its recording), the
+ * take starts there, and its end switches back (cleanup) */
+static void raw_photo_rec_task()
+{
+    printf("REC in photo mode: switching to movie LiveView\n");
+    if (!lv_set_movie_mode(1))
+    {
+        NotifyBox(5000, "Couldn't switch to movie mode");
+        lv_set_movie_mode(0);
+        photo_switching = 0;
+        return;
+    }
+    if (RAW_IS_IDLE && !RECORDING_H264)
+    {
+        printf("REC in photo mode: starting the take\n");
+        photo_take = 1;
+        NO_THREAD_SAFETY_CALL(raw_start_stop)();
+    }
+    else
+    {
+        lv_set_movie_mode(0);
+    }
+    photo_switching = 0;
+}
+
 static REQUIRES(GuiMainTask)
 unsigned int raw_rec_keypress_cbr(unsigned int key)
 {
+    /* a REC press that went to Canon, to start or stop its own movie (it
+     * records from photo mode too, in movie mode while it runs): the
+     * second REC code that follows, or a press soon after, must not start
+     * a raw take next to Canon's recording */
+    static int canon_rec_ms = -100000;  /* long ago (not INT_MIN: now - INT_MIN overflows) */
+
     if (!raw_video_enabled)
         return 1;
 
-    if (!is_movie_mode())
+    /* raw video is for movie mode only.  The one exception: stopping a 1:1
+     * take, during which Canon's 1:1 mode (a stills feature) may not
+     * report movie mode */
+    if (!is_movie_mode() && !(ps_take && !RAW_IS_IDLE))
+    {
+        if (key == MODULE_KEY_REC && LV_MODE_SWITCH)
+        {
+            /* REC in photo mode: a raw take in movie LiveView instead of
+             * Canon's movie (raw_photo_rec_task); repeats while switching
+             * are swallowed.  Until that works: neither, and a note */
+            if (!PHOTO_MODE_TAKES)
+            {
+                NotifyBox(3000, "Raw video currently only works in movie mode");
+                return 0;
+            }
+            if (!photo_switching && RAW_IS_IDLE && !RECORDING_H264 && !gui_menu_shown())
+            {
+                photo_switching = 1;
+                task_create("raw_photo_rec", 0x1a, 0x1000, raw_photo_rec_task, 0);
+            }
+            return 0;
+        }
+        if (key == MODULE_KEY_REC)
+            canon_rec_ms = get_ms_clock();
         return 1;
-
-    /* keys are only hooked in LiveView */
-    if (!liveview_display_idle() && !RECORDING_RAW)
-        return 1;
+    }
 
     /* if you somehow managed to start recording H.264, let it stop */
     if (RECORDING_H264 && !use_h264_proxy())
+    {
+        if (key == MODULE_KEY_REC)
+            canon_rec_ms = get_ms_clock();
         return 1;
+    }
+
+    if (key == MODULE_KEY_REC && RAW_IS_IDLE && get_ms_clock() - canon_rec_ms < 3000)
+        return 1;
+
+    /* switching from photo mode: raw_photo_rec_task starts the take */
+    if (key == MODULE_KEY_REC && photo_switching)
+        return 0;
+
+    /* keys are only hooked in LiveView; where raw recording uses Canon's
+     * H.264 encoder memory (H264_ENCODER_MEM_TAKEN), the REC key is also
+     * blocked outside LiveView (Canon or ML menus, Q screen), where it
+     * would start Canon's recorder */
+    if (!liveview_display_idle() && !RECORDING_RAW)
+        return (key == MODULE_KEY_REC && H264_ENCODER_MEM_TAKEN) ? 0 : 1;
     
     /* block the zoom key while recording */
     if (!RAW_IS_IDLE && key == MODULE_KEY_PRESS_ZOOMIN)
@@ -4344,6 +6500,8 @@ static int raw_rec_should_preview(void)
 {
     if (!raw_video_enabled) return 0;
     if (!is_movie_mode()) return 0;
+    /* 1:1 movie takes: LiveView raw isn't what we record */
+    if (ps_take || MOVIE_1TO1_SOURCE) return 0;
 
     /* keep x10 mode unaltered, for focusing */
     if (lv_dispsize == 10) return 0;
@@ -4495,6 +6653,11 @@ static struct lvinfo_item info_items[] = {
 
 static unsigned int raw_rec_init()
 {
+    if (start_warmup < 0)
+    {
+        start_warmup = FIO_HasSpeedClass() ? 1 : 0;
+    }
+
     cam_eos_m = is_camera("EOSM", "2.0.2");
     cam_5d2   = is_camera("5D2",  "2.1.2");
     cam_50d   = is_camera("50D",  "1.0.9");
@@ -4545,17 +6708,31 @@ static unsigned int raw_rec_init()
     int version = get_digic_version();
     if (version > 5)
     { // hide features unsupported on modern cams
-        raw_video_menu->children[11].shidden = 1; // Hide "Small hacks"
+        raw_menu_children = raw_video_menu->children;
+        raw_menu_hide(&small_hacks, 1);
         small_hacks = 0;
+    }
+    raw_menu_children = raw_video_menu->children;
+    if (!crx_enc_available())
+    {
+        crx_compress = 0;
     }
     if (version != 5)
     { // so far, only Digic 5 has working lossless compression, hide on other cams
-        if (raw_video_menu->children[2].max > 2)
+        struct menu_entry *fmt = raw_menu_item(&output_format);
+        if (fmt && fmt->max > 2)
         {
-            raw_video_menu->children[2].max = 2; // hide lossless options, which are 3, 4, 5
-            output_format = 0; // plain 14-bit, no lossless support on D4, D678 (yet)
+            fmt->max = 2; // hide lossless options, which are 3, 4, 5
+        }
+        if (output_format > 2)
+        {
+            /* no Canon lossless on D4, D678 (yet): plain 14-bit. Keep a
+             * saved 12/10-bit choice (it was reset at every start) */
+            output_format = 0;
         }
     }
+
+    raw_menu_refresh();
 
     menu_add("Movie", raw_video_menu, COUNT(raw_video_menu));
 
@@ -4613,6 +6790,7 @@ MODULE_CBRS_START()
     MODULE_NAMED_CBR("snd_rec_enabled", h264_proxy_snd_rec_cbr)
 MODULE_CBRS_END()
 
+
 MODULE_CONFIGS_START()
     MODULE_CONFIG(raw_video_enabled)
     MODULE_CONFIG(resolution_index_x)
@@ -4627,7 +6805,11 @@ MODULE_CONFIGS_START()
     MODULE_CONFIG(use_srm_memory)
     MODULE_CONFIG(small_hacks)
     MODULE_CONFIG(warm_up)
+    MODULE_CONFIG(start_warmup)
+    MODULE_CONFIG(take_log)
     MODULE_CONFIG(sync_beep)
     MODULE_CONFIG(output_format)
+    MODULE_CONFIG(crx_compress)
     MODULE_CONFIG(h264_proxy_menu)
+    MODULE_CONFIG(lossy_src)
 MODULE_CONFIGS_END()
