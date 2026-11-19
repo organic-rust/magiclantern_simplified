@@ -92,9 +92,10 @@ void ptp_mailbox_set(int slot, const char *name, void *ptr, volatile uint32_t *l
 static void ptp_init( void *unused )
 {
 #ifndef CONFIG_40D 
-#ifdef CONFIG_DIGIC_8X
-	/* D8 (M6II): the registration wrapper returns 0x17 until Canon has
-	 * set up its operation list; retry for a while */
+#if defined(CONFIG_DIGIC_8X) || defined(CONFIG_5D2)
+	/* D8 (M6II), 5D2: the registration wrapper returns 0x17 until Canon has
+	 * set up its operation list; retry for a while (5D2 2.1.2: its handler
+	 * table pointer at 0x14178 stays NULL until PtpDps runs) */
 	for (int i = 0; i < 20; i++)
 	{
 		uint32_t ret = ptp_register_all_handlers();

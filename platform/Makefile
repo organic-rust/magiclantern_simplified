@@ -17,9 +17,10 @@ PLATFORM_DIR = $(TOP_DIR)/platform
 #
 # You can override like this:
 # make clean; make CONFIG_QEMU=y
-CONFIG_PTP      = n
-CONFIG_PTP_CHDK = n
-CONFIG_PTP_ML   = n
+# a camera Makefile may enable the PTP ones before including this file
+CONFIG_PTP      ?= n
+CONFIG_PTP_CHDK ?= n
+CONFIG_PTP_ML   ?= n
 CONFIG_GDB      = n
 CONFIG_GDBSTUB  = n
 CONFIG_CONSOLE  = y

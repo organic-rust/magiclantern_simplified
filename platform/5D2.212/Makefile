@@ -19,6 +19,12 @@ RESTARTSTART = 0x4E000
 
 ML_SRC_EXTRA_OBJS = $(BUILD_DIR)/afma.o $(BUILD_DIR)/asm.o
 
+# USB access: CHDK-style memory read/write and card files, with ML's
+# extensions (directory listing, ranged reads, mkdir/rename/remove for
+# installing builds, mailbox). Client: contrib/ptp/ptp_ml.py --cam 5D2
+CONFIG_PTP = y
+CONFIG_PTP_CHDK = y
+
 # Boot progress on the card LED, for cameras that hang with a black screen:
 #   make BOOT_LED_DIAG=y
 # See contrib/recovery/5D2.212/BOOT-LED-DIAG.md
