@@ -65,6 +65,10 @@ CAMERAS = {
     "5D4":  ("5D Mark IV",  "A:", "5D4.133"),
     "M6II": ("M6 Mark II",  "B:", "M6II.111"),
 }
+# USB product IDs, for cameras whose product string is just "Canon Digital Camera"
+CAMERA_PIDS = {
+    0x3199: "5D2",
+}
 
 
 def cam_build_file(cam, name):
@@ -72,6 +76,8 @@ def cam_build_file(cam, name):
 
 
 def detect_cam(dev):
+    if getattr(dev, "idProduct", None) in CAMERA_PIDS:
+        return CAMERA_PIDS[dev.idProduct]
     try:
         product = usb.util.get_string(dev, dev.iProduct) or ""
     except (usb.core.USBError, ValueError):
