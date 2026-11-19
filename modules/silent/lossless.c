@@ -78,6 +78,84 @@ static void (*TTL_Finish)(void * ResLock, void * TTL_Args, uint32_t * output_siz
 extern uint32_t edmac_write_chan;
 extern uint32_t edmac_read_chan;
 
+/* 5D2 (DIGIC 4): ProcessTwoInTwoOutJpegPath
+ *
+ * Canon's CR2 path (sdfExecuteMem1ToRawPath, FF888C8C) fills a TTJ_Args struct with
+ * FF9BEB18 (same role as TTL_SetArgs), then makes one blocking call:
+ * FFA59B58(lock, args, &output_size). That call locks the engine resources,
+ * sets up JPCORE + EDMAC, starts, waits for completion (event flag, 5 s timeout),
+ * stops and unlocks. There are no separate Prepare/Start/Stop/Finish steps to call.
+ *
+ * The layout is DIGIC 5's TwoInTwoOutLosslessPath_args minus one engio pointer;
+ * offsets below were checked against FF9BEB18, FFA594C4, FFA591A8 and FFA590A4,
+ * and against Canon's live struct (RAM 0x2AC34) after a RAW capture.
+ *
+ * First milestone: full-resolution frames only, with Canon's RAW engio lists
+ * unchanged (three vertical slices of 1936/1936/1920 px, as in a CR2).
+ */
+struct TwoInTwoOutJpegPath_args_5D2
+{
+    uint32_t * ResLockKey;              /* 0x00: Canon's resource list (not used by FFA59B58) */
+    uint32_t   ResLockKeySize;          /* 0x04 */
+    uint32_t * engio_prep1;             /* 0x08: input path, RD1 EDMAC geometry, slicing */
+    uint32_t * engio_prep2;             /* 0x0C: JPCORE settings (Canon: "VARIABLE_DATA"+0x338) */
+    uint32_t * engio_pre_jpcore;        /* 0x10 */
+    uint32_t * engio_post_jpcore;       /* 0x14 */
+    uint32_t * engio_stop;              /* 0x18 */
+    uint32_t * engio_after_ppr;         /* 0x1C */
+    uint32_t * engio_ppr;               /* 0x20: run after writing PPR_table to C0F0857C */
+    uint16_t * PPR_table;               /* 0x24 */
+    uint32_t * goes_to_obinteg_C0F0E000_size_0x188;     /* 0x28: Canon: "RAW_OBWB" */
+    uint32_t * goes_to_C0F21000_size_0x7E0;             /* 0x2C: Canon: "LUCKY_ANGEL" (sRAW only) */
+    uint32_t * LuckyEnable_goes_to_C0F20000_size_0x1000;/* 0x30 */
+    uint16_t   LuckyEnable;             /* 0x34: 0xFFFF = skip */
+    uint16_t   xRes;                    /* 0x36 */
+    uint16_t   yRes;                    /* 0x38 */
+    uint16_t   off_0x3A;
+    uint32_t   SamplePrecision;         /* 0x3C: 14 = RAW (lossless), 15 = sRAW, 16 = mRAW */
+    uint32_t   off_0x40;                /* 0x40: low byte = table index */
+    uint32_t   RD1_Channel;             /* 0x44 */
+    uint32_t   RD1_StartFlags;
+    uint32_t   RD1_Flags;
+    uint32_t   RD1_Connection;
+    void *     RD1_Address;             /* 0x54: EDMAC start = RD1_Address + RD1_Offset */
+    int32_t    RD1_Offset;              /* 0x58 */
+    uint32_t   RD2_Channel;             /* 0x5C */
+    uint32_t   RD2_StartFlags;
+    uint32_t   RD2_Flags;
+    uint32_t   RD2_Connection;
+    void *     RD2_Address;             /* 0x6C: 0 = not used */
+    int32_t    RD2_Offset;
+    uint32_t   WR1_Channel;             /* 0x74 */
+    uint32_t   WR1_StartFlags;
+    uint32_t   WR1_Flags;
+    uint32_t   WR1_Connection;
+    struct memSuite * WR1_MemSuite;     /* 0x84 */
+    uint32_t   off_0x88;
+    uint32_t   WR2_Channel;             /* 0x8C */
+    uint32_t   WR2_StartFlags;
+    uint32_t   WR2_Flags;
+    uint32_t   WR2_Connection;
+    void *     WR2_Address;             /* 0x9C: 0 = not used */
+    uint32_t   WR2_Offset;              /* 0xA0 */
+};
+
+_Static_assert(sizeof(struct TwoInTwoOutJpegPath_args_5D2) == 0xA4, "TTJ_Args 5D2 size");
+_Static_assert(__builtin_offsetof(struct TwoInTwoOutJpegPath_args_5D2, xRes) == 0x36, "xRes");
+_Static_assert(__builtin_offsetof(struct TwoInTwoOutJpegPath_args_5D2, SamplePrecision) == 0x3C, "type");
+_Static_assert(__builtin_offsetof(struct TwoInTwoOutJpegPath_args_5D2, RD1_Address) == 0x54, "RD1");
+_Static_assert(__builtin_offsetof(struct TwoInTwoOutJpegPath_args_5D2, WR1_MemSuite) == 0x84, "WR1");
+_Static_assert(__builtin_offsetof(struct TwoInTwoOutJpegPath_args_5D2, WR2_Address) == 0x9C, "WR2");
+
+static struct TwoInTwoOutJpegPath_args_5D2 TTJ_Args_5D2;
+static void (*TTJ_SetArgs_5D2)(int unused, void * TTJ_Args, int PictureSize) = NULL;
+static int  (*TTJ_Process_5D2)(struct LockEntry * lock, void * TTJ_Args, uint32_t * output_size) = NULL;
+static int lossless_compress_raw_5D2(
+    struct memSuite * dst_suite, void * src,
+    int src_width, int src_x, int src_y,
+    int width, int height
+);
+
 static void decompress_init();
 int lossless_init()
 {
@@ -184,6 +262,13 @@ int lossless_init()
         TTL_Finish      = (void *) 0xFF4384E4;  /* called next; calls UnlockEngineResources and returns output size from JpCoreCompleteCBR */
     }
 
+    if (is_camera("5D2", "2.1.2"))
+    {
+        /* ProcessTwoInTwoOutJpegPath, 5D2 2.1.2 (one blocking call, see above) */
+        TTJ_SetArgs_5D2 = (void *) 0xFF9BEB18;  /* fills TTJ_Args struct; PictureSize(Mem1ToRaw) */
+        TTJ_Process_5D2 = (void *) 0xFFA59B58;  /* lock, setup, start, wait, stop, unlock; returns output size */
+    }
+
     lossless_sem = create_named_semaphore(NULL, SEM_CREATE_LOCKED);
     
     if (is_camera("700D", "*") || is_camera("650D", "*") || is_camera("EOSM", "*") || is_camera("100D", "*"))
@@ -254,14 +339,177 @@ int lossless_init()
         TTL_ResLock = CreateResLockEntry(resources, COUNT(resources));
     }
     
+    else if (is_camera("5D2", "*"))
+    {
+        /* Canon's own list for the RAW path (RAM 0xFC00, 17 entries, read from the camera);
+         * it uses Canon's EDMAC channels, which are idle once LiveView is paused */
+        uint32_t resources[] = {
+            0x10002,    /* read EDMAC index 2 = channel 0x0A (RD1, uncompressed input) */
+            0x00003,    /* write EDMAC channel 3 (WR1, compressed output) */
+            0x00004,    /* write EDMAC channel 4 (WR2, not started) */
+            0x30000,    /* read connection 0 */
+            0x20005,    /* write connection 5 */
+            0x20016,    /* write connection 22 */
+            0x50003,
+            0x5000d,
+            0x5000f,
+            0x5001a,
+            0x80000,
+            0x90000,
+            0xa0000,
+            0x160000,
+            0x130003,
+            0x130004,
+            0x130005,
+        };
+
+        TTL_ResLock = CreateResLockEntry(resources, COUNT(resources));
+    }
+
     /* optionally initialize the decompression routines */
     decompress_init();
 
     /* return 1 if everything looks alright */
-    return TTL_Start && lossless_sem && TTL_ResLock;
+    return (TTL_Start || TTJ_Process_5D2) && lossless_sem && TTL_ResLock;
 }
 
 static uint32_t start_time = 0;
+
+/* 5D2: Canon takes these from a per-shot object ("VARIABLE_DATA"+0x338), which only
+ * exists during a regular capture. Values read from the camera right after a RAW shot.
+ * FIXME: find out whether any of them depend on the shot (WB?) */
+static uint32_t TTJ_JpCore_5D2[] = {
+    0xC0F12040, 0x00000001,
+    0xC0F12044, 0x040004D9,
+    0xC0F12048, 0x04000380,
+    0xC0F1204C, 0x04000380,
+    0xC0F12050, 0x040014E8,
+    0xC0F12054, 0x3A810801,
+    0xFFFFFFFF, 0xFFFFFFFF,
+};
+
+/* 5D2: geometry hardcoded in Canon's RAW engio list (prep1) */
+#define TTJ_5D2_WIDTH   5792
+#define TTJ_5D2_HEIGHT  3804
+#define TTJ_5D2_ROWS    3808    /* rows read by RD1 (C0F04A10) */
+
+/* first milestone: also write the input, the output and a log to ML/LOGS,
+ * so the output can be decoded on a PC and compared pixel by pixel */
+#define TTJ_5D2_DUMP 1
+
+#if TTJ_5D2_DUMP
+static void lossless_5D2_dump(void * src, void * out, uint32_t out_size,
+                              int err, uint32_t elapsed_us)
+{
+    FILE * f = FIO_CreateFile("ML/LOGS/LJ92.LOG");
+    if (f)
+    {
+        my_fprintf(f, "5D2 lossless test\n");
+        my_fprintf(f, "src %x, out %x, out_size %d, err %d, elapsed %d us\n",
+            src, out, out_size, err, elapsed_us);
+        my_fprintf(f, "args after the call:\n");
+        uint32_t * a = (uint32_t *) &TTJ_Args_5D2;
+        for (int i = 0; i < (int) (sizeof(TTJ_Args_5D2) / 4); i++)
+        {
+            my_fprintf(f, "+%02x %08x\n", i * 4, a[i]);
+        }
+        FIO_CloseFile(f);
+    }
+
+    f = FIO_CreateFile("ML/LOGS/LJ92SRC.RAW");
+    if (f)
+    {
+        FIO_WriteFile(f, src, TTJ_5D2_WIDTH * 14 / 8 * TTJ_5D2_ROWS);
+        FIO_CloseFile(f);
+    }
+
+    if (out && out_size)
+    {
+        f = FIO_CreateFile("ML/LOGS/LJ92OUT.BIN");
+        if (f)
+        {
+            FIO_WriteFile(f, out, out_size);
+            FIO_CloseFile(f);
+        }
+    }
+}
+#endif
+
+static int lossless_compress_raw_5D2(
+    struct memSuite * dst_suite, void * src,
+    int src_width, int src_x, int src_y,
+    int width, int height
+)
+{
+    /* Canon's RAW engio lists are for full-resolution frames only;
+     * other sizes need patched copies (not done yet) */
+    if (src_x || src_y || src_width != TTJ_5D2_WIDTH ||
+        width != TTJ_5D2_WIDTH || height < TTJ_5D2_HEIGHT)
+    {
+        printf("[TTJ] %dx%d (%d,%d of %d): not supported yet\n",
+            width, height, src_x, src_y, src_width);
+        return -4;
+    }
+
+    struct TwoInTwoOutJpegPath_args_5D2 * a = &TTJ_Args_5D2;
+
+    /* PictureSize 0 = RAW: Canon's resource list, engio lists, channels, type 14 */
+    TTJ_SetArgs_5D2(0, a, 0);
+
+    if (a->SamplePrecision != 14 || a->engio_prep1 == NULL)
+    {
+        printf("[TTJ] unexpected SetArgs result (%d, %x)\n", a->SamplePrecision, a->engio_prep1);
+        return -5;
+    }
+
+    /* what Canon's caller sets after SetArgs (FF888CE0..FF888E78);
+     * RAW_OBWB (+0x28) stays NULL, as with TTL_SetArgs on DIGIC 5 */
+    a->xRes         = TTJ_5D2_WIDTH;
+    a->yRes         = TTJ_5D2_HEIGHT;
+    a->engio_prep2  = TTJ_JpCore_5D2;
+    a->RD1_Address  = UNCACHEABLE(src);
+    a->RD1_Offset   = 0;    /* Canon: -0x1C from its image buffer pointer; ours is the EDMAC start */
+    a->RD2_Address  = 0;
+    a->WR1_MemSuite = dst_suite;
+    a->WR2_Address  = 0;    /* WR2 is only started when nonzero (FFA591A8) */
+
+    void * WR1_Address = (dst_suite)
+        ? GetMemoryAddressOfMemoryChunk(GetFirstChunkFromSuite(dst_suite))
+        : 0;
+
+    if (WR1_Address)
+    {
+        MEM(WR1_Address) = 0;
+    }
+
+    /* output size is only written when JPCORE reports completion;
+     * on timeout FFA59B58 still cleans up and returns 0, leaving this at 0 */
+    uint32_t output_size = 0;
+
+    start_time = get_us_clock();
+    int err = TTJ_Process_5D2(TTL_ResLock, a, &output_size);
+    uint32_t elapsed = get_us_clock() - start_time;
+
+    printf("[TTJ] err %d, output %d bytes, %d us\n", err, output_size, elapsed);
+
+#if TTJ_5D2_DUMP
+    lossless_5D2_dump(src, WR1_Address, output_size, err, elapsed);
+#endif
+
+    if (output_size == 0)
+    {
+        /* err set: LockEngineResources failed (FFA59B0C);
+         * otherwise timeout or JPCORE error (FFA59B58 cleans up and returns 0) */
+        return err ? -6 : -2;
+    }
+
+    if (WR1_Address && MEM(WR1_Address) != 0xC4FFD8FF)
+    {
+        return -3;
+    }
+
+    return output_size;
+}
 
 /* returns output size if successful, negative on error */
 int lossless_compress_raw_rectangle(
@@ -270,6 +518,11 @@ int lossless_compress_raw_rectangle(
     int width, int height
 )
 {
+    if (TTJ_Process_5D2 && TTL_ResLock)
+    {
+        return lossless_compress_raw_5D2(dst_suite, src, src_width, src_x, src_y, width, height);
+    }
+
     if (!TTL_ResLock || !lossless_sem || !TTL_Start)
     {
         /* not initialized */
