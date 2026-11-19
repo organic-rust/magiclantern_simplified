@@ -377,15 +377,38 @@ static uint32_t start_time = 0;
 
 /* 5D2: Canon takes these from a per-shot object ("VARIABLE_DATA"+0x338), which only
  * exists during a regular capture. Values read from the camera right after a RAW shot.
- * FIXME: find out whether any of them depend on the shot (WB?) */
+ * They change slightly between shots (high halves track the measured black level,
+ * 0x400 / 0x3FA / 0x3FD); these are from the shot that RAW_OBWB below comes from. */
 static uint32_t TTJ_JpCore_5D2[] = {
     0xC0F12040, 0x00000001,
-    0xC0F12044, 0x040004D9,
-    0xC0F12048, 0x04000380,
-    0xC0F1204C, 0x04000380,
-    0xC0F12050, 0x040014E8,
-    0xC0F12054, 0x3A810801,
+    0xC0F12044, 0x03FD04D0,
+    0xC0F12048, 0x03FD0380,
+    0xC0F1204C, 0x03FD0380,
+    0xC0F12050, 0x03FD14DB,
+    0xC0F12054, 0x3A8107FB,
     0xFFFFFFFF, 0xFFFFFFFF,
+};
+
+/* 5D2: Canon's RAW_OBWB table (args +0x28, copied to C0F0E000, 0x188 bytes),
+ * read from the camera right after a RAW shot. It configures the OB / WB stage
+ * in front of JPCORE as pass-through (black offset 0 at +0x14, all gains 0x400).
+ * Without it, the stage keeps LiveView's settings and the output is
+ * gain * (raw - 1024) + 512 per channel. The words at +0xF0..+0x10C are black
+ * levels measured on that shot. */
+static uint32_t TTJ_RAW_OBWB_5D2[0x188 / 4] = {
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x000001FF, 0x00000000, 0x00000000, 0x00000000,  /* +0x000 */
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,  /* +0x020 */
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000400, 0x00000400, 0x00000400,  /* +0x040 */
+    0x00000400, 0x00000400, 0x00000400, 0x00000400, 0x00000400, 0x00000400, 0x00000400, 0x00000400,  /* +0x060 */
+    0x00000400, 0x00000400, 0x00000400, 0x00000400, 0x00000400, 0x00000000, 0x00000001, 0x00000000,  /* +0x080 */
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,  /* +0x0A0 */
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,  /* +0x0C0 */
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x000003FD, 0x00003FFF, 0x00000001, 0x00000000,  /* +0x0E0 */
+    0x000003FE, 0x000003FF, 0x000003FB, 0x000003FB, 0x00000000, 0x00000000, 0x00000000, 0x00000000,  /* +0x100 */
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,  /* +0x120 */
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,  /* +0x140 */
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,  /* +0x160 */
+    0x00000000, 0x00000000,  /* +0x180 */
 };
 
 /* 5D2: geometry hardcoded in Canon's RAW engio list (prep1) */
@@ -462,13 +485,14 @@ static int lossless_compress_raw_5D2(
         return -5;
     }
 
-    /* what Canon's caller sets after SetArgs (FF888CE0..FF888E78);
-     * RAW_OBWB (+0x28) stays NULL, as with TTL_SetArgs on DIGIC 5 */
+    /* what Canon's caller sets after SetArgs (FF888CE0..FF888E78) */
     a->xRes         = TTJ_5D2_WIDTH;
     a->yRes         = TTJ_5D2_HEIGHT;
     a->engio_prep2  = TTJ_JpCore_5D2;
+    a->goes_to_obinteg_C0F0E000_size_0x188 = TTJ_RAW_OBWB_5D2;
     a->RD1_Address  = UNCACHEABLE(src);
-    a->RD1_Offset   = 0;    /* Canon: -0x1C from its image buffer pointer; ours is the EDMAC start */
+    /* RD1_Offset stays at SetArgs' -0x1C (16 px): the input path crops 16 px on the
+     * left (and 2 rows at the top), so the output starts at the buffer start */
     a->RD2_Address  = 0;
     a->WR1_MemSuite = dst_suite;
     a->WR2_Address  = 0;    /* WR2 is only started when nonzero (FFA591A8) */
