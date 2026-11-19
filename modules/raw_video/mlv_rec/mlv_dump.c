@@ -1098,6 +1098,7 @@ int get_header_size(void *type)
     HEADER_SIZE("WBAL", mlv_wbal_hdr_t);
     HEADER_SIZE("DEBG", mlv_debg_hdr_t);
     HEADER_SIZE("VERS", mlv_vers_hdr_t);
+    HEADER_SIZE("LJSL", mlv_ljsl_hdr_t);
     
     return 0;
 
@@ -1918,6 +1919,7 @@ int main (int argc, char *argv[])
     lv_rec_file_footer_t lv_rec_footer;
     mlv_file_hdr_t main_header;
     mlv_diso_hdr_t diso_info;
+    mlv_ljsl_hdr_t ljsl_info;
     mlv_lens_hdr_t lens_info;
     mlv_expo_hdr_t expo_info;
     mlv_idnt_hdr_t idnt_info;
@@ -1930,6 +1932,7 @@ int main (int argc, char *argv[])
     /* initialize stuff */
     memset(&lv_rec_footer, 0x00, sizeof(lv_rec_file_footer_t));
     memset(&diso_info, 0x00, sizeof(mlv_diso_hdr_t));
+    memset(&ljsl_info, 0x00, sizeof(mlv_ljsl_hdr_t));
     memset(&lens_info, 0x00, sizeof(mlv_lens_hdr_t));
     memset(&expo_info, 0x00, sizeof(mlv_expo_hdr_t));
     memset(&idnt_info, 0x00, sizeof(mlv_idnt_hdr_t));
@@ -2985,6 +2988,41 @@ read_headers:
                                     goto skip_block;
                                 }
                                 goto abort;
+                            }
+
+                            /* CR2-style slices (LJSL block, 5D2): the stream holds each
+                             * slice in turn, all rows of it, slices from the left */
+                            if(ljsl_info.sliceCount)
+                            {
+                                int width = lj92_width * lj92_components;
+                                int height = lj92_height;
+                                int total = ljsl_info.sliceCount * ljsl_info.sliceWidth + ljsl_info.lastSliceWidth;
+
+                                if(total != width)
+                                {
+                                    print_msg(MSG_ERROR, "    LJ92: slices (%d x %d + %d) don't add up to the frame width %d\n",
+                                        ljsl_info.sliceCount, ljsl_info.sliceWidth, ljsl_info.lastSliceWidth, width);
+                                    goto abort;
+                                }
+
+                                uint16_t *unsliced = malloc(out_size);
+                                const uint16_t *src = decompressed;
+                                int x0 = 0;
+
+                                for(int slice = 0; slice <= ljsl_info.sliceCount; slice++)
+                                {
+                                    int w = (slice < ljsl_info.sliceCount) ? ljsl_info.sliceWidth : ljsl_info.lastSliceWidth;
+
+                                    for(int y = 0; y < height; y++)
+                                    {
+                                        memcpy(&unsliced[y * width + x0], src, w * sizeof(uint16_t));
+                                        src += w;
+                                    }
+                                    x0 += w;
+                                }
+
+                                free(decompressed);
+                                decompressed = unsliced;
                             }
                             
                             if(verbose)
@@ -4072,6 +4110,18 @@ read_headers:
                     print_msg(MSG_INFO, "     Mode:        %d\n", diso_info.dualMode);
                     print_msg(MSG_INFO, "     ISO Value:   %d\n", diso_info.isoValue);
                 }
+            }
+            else if(!memcmp(mlv_block->blockType, "LJSL", 4))
+            {
+                ljsl_info = *(mlv_ljsl_hdr_t *)mlv_block;
+
+                if(verbose)
+                {
+                    print_msg(MSG_INFO, "     Slices:      %d x %d + %d\n", ljsl_info.sliceCount, ljsl_info.sliceWidth, ljsl_info.lastSliceWidth);
+                }
+
+                /* decompressed frames are plain raster: the block no longer applies */
+                if(decompress_input) goto skip_block;
             }
             else if(!memcmp(mlv_block->blockType, "NULL", 4))
             {

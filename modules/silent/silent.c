@@ -74,6 +74,10 @@ static char image_file_name[100];
 static uint32_t mlv_max_filesize = 0xFFFFFFFF;
 static int mlv_file_frame_number = 0;
 
+/* set while saving LJ92 frames from an encoder that slices them (5D2) */
+static int silent_mlv_lj92 = 0;
+static struct lossless_layout silent_mlv_lj92_layout;
+
 static int long_exposure_fix_enabled = 0;
 
 /* forward reference */
@@ -159,9 +163,25 @@ static MENU_UPDATE_FUNC(silent_pic_display)
             break;
 
         case SILENT_PIC_FILE_FORMAT_LOSSLESS_DNG:
-            MENU_SET_HELP("File format: 14-bit lossless DNG, individual files.");
-            MENU_APPEND_VALUE(", L-DNG");
+        {
+            struct lossless_layout layout;
+            if (lossless_get_layout(&layout))
+            {
+                /* 5D2: CR2-style slices, which a DNG can't describe */
+                MENU_SET_HELP("14-bit lossless, saved as one-frame MLV (needs mlv_lite). Convert with mlv_dump / MLV App.");
+                MENU_APPEND_VALUE(", L-MLV");
+                if (!silent_pic_mlv_available)
+                {
+                    MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Lossless on this camera saves MLV: load mlv_lite.");
+                }
+            }
+            else
+            {
+                MENU_SET_HELP("File format: 14-bit lossless DNG, individual files.");
+                MENU_APPEND_VALUE(", L-DNG");
+            }
             break;
+        }
     }
     
     if (silent_pic_mode == SILENT_PIC_MODE_FULLRES && (shooting_mode != SHOOTMODE_M || is_movie_mode()))
@@ -185,8 +205,13 @@ static MENU_UPDATE_FUNC(silent_pic_file_format_display)
 static char* silent_pic_get_name()
 {
     char *extension;
-    
-    if (silent_pic_file_format == SILENT_PIC_FILE_FORMAT_MLV)
+    struct lossless_layout layout;
+
+    /* 5D2: lossless pictures are saved as MLV (sliced LJ92) */
+    int is_mlv = (silent_pic_file_format == SILENT_PIC_FILE_FORMAT_MLV) ||
+                 (silent_pic_file_format == SILENT_PIC_FILE_FORMAT_LOSSLESS_DNG && lossless_get_layout(&layout));
+
+    if (is_mlv)
     {
         extension = "MLV";
     }
@@ -196,8 +221,6 @@ static char* silent_pic_get_name()
     }
     
     int file_number = get_shooting_card()->file_number;
-    
-    int is_mlv = (silent_pic_file_format == SILENT_PIC_FILE_FORMAT_MLV);
     
     if (is_intervalometer_running() && !is_mlv)
     {
@@ -270,7 +293,7 @@ static int silent_write_mlv_chunk_headers(FILE* save_file, struct raw_info * raw
     mlv_file_hdr.fileNum = file_num;
     mlv_file_hdr.fileCount = 0; //autodetect
     mlv_file_hdr.fileFlags = 4;
-    mlv_file_hdr.videoClass = 1;
+    mlv_file_hdr.videoClass = 1 | (silent_mlv_lj92 ? MLV_VIDEO_CLASS_FLAG_LJ92 : 0);
     mlv_file_hdr.audioClass = 0;
     mlv_file_hdr.videoFrameCount = 0; //autodetect
     mlv_file_hdr.audioFrameCount = 0;
@@ -288,6 +311,20 @@ static int silent_write_mlv_chunk_headers(FILE* save_file, struct raw_info * raw
     rawi.yRes = raw_info->height;
     rawi.raw_info = *raw_info;
     if (FIO_WriteFile(save_file, &rawi, rawi.blockSize) != (int)rawi.blockSize) return 0;
+
+    if (silent_mlv_lj92 && silent_mlv_lj92_layout.slice_count)
+    {
+        /* how to reassemble the sliced LJ92 stream */
+        mlv_ljsl_hdr_t ljsl;
+        memset(&ljsl, 0, sizeof(ljsl));
+        mlv_set_type((mlv_hdr_t *)&ljsl, "LJSL");
+        mlv_set_timestamp((mlv_hdr_t *)&ljsl, mlv_start_timestamp);
+        ljsl.blockSize = sizeof(ljsl);
+        ljsl.sliceCount = silent_mlv_lj92_layout.slice_count;
+        ljsl.sliceWidth = silent_mlv_lj92_layout.slice_width;
+        ljsl.lastSliceWidth = silent_mlv_lj92_layout.last_slice_width;
+        if (FIO_WriteFile(save_file, &ljsl, ljsl.blockSize) != (int)ljsl.blockSize) return 0;
+    }
     
     return 1;
 }
@@ -511,8 +548,79 @@ write_error:
     return 0;
 }
 
+/* 5D2: the hardware encoder slices the frame like a CR2, which a DNG can't
+ * describe; save a one-frame LJ92 MLV with an LJSL block instead
+ * (mlv_dump / MLV App reassemble it) */
+static int save_mlv(struct raw_info * raw_info);
+
+static int save_lossless_sliced_mlv(struct raw_info * raw_info, struct lossless_layout * layout)
+{
+    if (!silent_pic_mlv_available)
+    {
+        bmp_printf( FONT_MED, 0, 83, "Lossless on this camera saves MLV: load mlv_lite.");
+        return 0;
+    }
+
+    /* ML reports the full-res buffer as 3804 rows; the buffer holds 3808 and the
+     * encoder reads them all (rows crop_top .. crop_top + height end up in the stream) */
+    if (raw_info->width != layout->width || raw_info->height < layout->height)
+    {
+        bmp_printf( FONT_MED, 0, 83, "Lossless: %dx%d not supported", raw_info->width, raw_info->height);
+        return 0;
+    }
+
+    int max_compressed_size = ((uint64_t) raw_info->frame_size * 80 / 100) & ~0xFFF;
+    struct memSuite * out_suite = shoot_malloc_suite_contig(max_compressed_size);
+
+    if (!out_suite)
+    {
+        bmp_printf( FONT_MED, 0, 83, "Out of memory");
+        return 0;
+    }
+
+    int size = lossless_compress_raw(raw_info, out_suite);
+
+    if (size <= 0)
+    {
+        bmp_printf( FONT_MED, 0, 83, "Lossless compression error: %d", size);
+        shoot_free_suite(out_suite);
+        return 0;
+    }
+
+    if (size > out_suite->size)
+    {
+        bmp_printf( FONT_MED, 0, 83, "Lossless: output truncated");
+        shoot_free_suite(out_suite);
+        return 0;
+    }
+
+    /* the stream covers rows crop_top .. crop_top + height of the buffer */
+    struct raw_info out_raw_info = *raw_info;
+    out_raw_info.buffer = GetMemoryAddressOfMemoryChunk(GetFirstChunkFromSuite(out_suite));
+    out_raw_info.frame_size = size;
+    out_raw_info.height = layout->height;
+    out_raw_info.active_area.y1 = MAX(0, raw_info->active_area.y1 - layout->crop_top);
+    out_raw_info.active_area.y2 = MIN(layout->height, raw_info->active_area.y2 - layout->crop_top);
+
+    silent_mlv_lj92 = 1;
+    silent_mlv_lj92_layout = *layout;
+    mlv_file_frame_number = 0;      /* one file per picture: don't mix with uncompressed MLVs */
+    int ok = save_mlv(&out_raw_info);
+    silent_mlv_lj92 = 0;
+    mlv_file_frame_number = 0;
+
+    shoot_free_suite(out_suite);
+    return ok;
+}
+
 static int save_lossless_dng(char * filename, struct raw_info * raw_info)
 {
+    struct lossless_layout layout;
+    if (lossless_get_layout(&layout))
+    {
+        return save_lossless_sliced_mlv(raw_info, &layout);
+    }
+
     struct raw_info out_raw_info = *raw_info;
 
     ASSERT(out_raw_info.bits_per_pixel == 14);
@@ -1872,6 +1980,16 @@ static unsigned int silent_init()
     {
         /* lossless DNG not available; hide from menu */
         silent_menu[0].children[3].max = 1;
+    }
+    else
+    {
+        struct lossless_layout layout;
+        if (lossless_get_layout(&layout))
+        {
+            /* 5D2: sliced LJ92 goes into an MLV, not a DNG */
+            static const char * choices_sliced[] = { "DNG", "MLV", "Lossless MLV" };
+            silent_menu[0].children[3].choices = choices_sliced;
+        }
     }
 
     if (!is_camera("5D3",  "*"))

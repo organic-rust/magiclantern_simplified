@@ -3,6 +3,7 @@
 #include "lens.h"
 #include "raw.h"
 #include "edmac.h"
+#include "lossless.h"
 
 struct TwoInTwoOutLosslessPath_args
 { 
@@ -421,9 +422,9 @@ static uint32_t TTJ_RAW_OBWB_5D2[0x188 / 4] = {
 #define TTJ_5D2_HEIGHT  3804
 #define TTJ_5D2_ROWS    3808    /* rows read by RD1 (C0F04A10) */
 
-/* first milestone: also write the input, the output and a log to ML/LOGS,
+/* debugging: also write the input, the output and a log to ML/LOGS,
  * so the output can be decoded on a PC and compared pixel by pixel */
-#define TTJ_5D2_DUMP 1
+#define TTJ_5D2_DUMP 0
 
 #if TTJ_5D2_DUMP
 static void lossless_5D2_dump(void * src, void * out, uint32_t out_size,
@@ -539,6 +540,28 @@ static int lossless_compress_raw_5D2(
     }
 
     return output_size;
+}
+
+/* layout of the compressed frames (see lossless.h) */
+int lossless_get_layout(struct lossless_layout * layout)
+{
+    memset(layout, 0, sizeof(*layout));
+
+    if (TTJ_Process_5D2)
+    {
+        /* Canon's RAW configuration: CR2 slicing (2 x 1936 + 1920 px, each
+         * slice all rows, one after another in the stream), and the input path
+         * drops the first 2 rows of the buffer (3808 rows in, 3804 out) */
+        layout->slice_count = 2;
+        layout->slice_width = 1936;
+        layout->last_slice_width = 1920;
+        layout->crop_top = 2;
+        layout->width = TTJ_5D2_WIDTH;
+        layout->height = TTJ_5D2_HEIGHT;
+        return 1;
+    }
+
+    return 0;
 }
 
 /* returns output size if successful, negative on error */

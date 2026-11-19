@@ -281,6 +281,18 @@ typedef struct {
 */
 }  mlv_vers_hdr_t;
 
+typedef struct {
+    uint8_t     blockType[4];       /* LJSL: LJ92 frames are sliced like a CR2 (5D2's hardware encoder) */
+    uint32_t    blockSize;          /* sizeof(mlv_ljsl_hdr_t) */
+    uint64_t    timestamp;
+    uint16_t    sliceCount;         /* number of slices of sliceWidth (CR2 tag 0xC640, [0]) */
+    uint16_t    sliceWidth;         /* [1], pixels */
+    uint16_t    lastSliceWidth;     /* [2]: one more slice of this width at the right */
+    uint16_t    reserved;
+    /* the decoded LJ92 sample stream holds each slice in turn, top to bottom,
+     * slice by slice from the left: unslice before using the frame as raster */
+}  mlv_ljsl_hdr_t;
+
 #pragma pack(pop)
 
 /* helper routines for filling structures from generic camera information */
