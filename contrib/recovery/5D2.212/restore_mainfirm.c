@@ -41,6 +41,19 @@
 /* boot flag block in ROM1 */
 #define BOOTFLAGS 0xF8000000
 
+/*
+ * Default build: FIRMWARE flag -> 0 (enabled; camera starts the main firmware).
+ * `make disable` builds the inverse with -DDISABLE_MAINFIRM: FIRMWARE flag ->
+ * 0xFFFFFFFF (disabled), the state a failed update leaves behind, in which the
+ * bootloader loads a .FIR from the card. Same guards, same flags_write() path;
+ * only the value differs. LED "solid on" then means: flag is now disabled.
+ */
+#ifdef DISABLE_MAINFIRM
+#define FIRMWARE_TARGET 0xFFFFFFFF
+#else
+#define FIRMWARE_TARGET 0
+#endif
+
 /* FROMUTILITY RAM copy: RAM = ROM - 0xFFFF0000 + 0xFD4E8 */
 #define BL_FLAGS_READ     0x102160  /* ROM FFFF4C78 */
 #define BL_FLAGS_WRITE    0x102148  /* ROM FFFF4C60 */
@@ -120,17 +133,17 @@ void __attribute__((noreturn)) restore_mainfirm(void)
         if (shadow[i] != MEM(BOOTFLAGS + 4 * i))
             blink(3, 3);
 
-    if (shadow[0] == 0)
-        blink(20, 20);                          /* already enabled */
+    if (shadow[0] == FIRMWARE_TARGET)
+        blink(20, 20);                          /* already in the requested state */
 
     uint32_t bootdisk = shadow[1];
 
-    shadow[0] = 0;        /* FIRMWARE: negative logic, 0 = enabled            */
+    shadow[0] = FIRMWARE_TARGET;  /* FIRMWARE: negative logic, 0 = enabled     */
                           /* BOOTDISK, RAM_EXE, UPDATE left as they were       */
 
     int r = flags_write();  /* 0 on success; -1 erase, -3 program, -2 verify   */
 
-    if (r != 0 || MEM(BOOTFLAGS) != 0 || MEM(BOOTFLAGS + 4) != bootdisk)
+    if (r != 0 || MEM(BOOTFLAGS) != FIRMWARE_TARGET || MEM(BOOTFLAGS + 4) != bootdisk)
         blink_long_short();
 
     MEM(CARD_LED) = LEDON;

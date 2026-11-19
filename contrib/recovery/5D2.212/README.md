@@ -75,6 +75,20 @@ Copy `AUTOEXEC.BIN` to the root of a card made bootable (EOS_DEVELOP +
 BOOTDISK, e.g. with EOScard / MacBoot / make_bootable.sh). No `.FIR` file on
 the card.
 
+## Inverse: disable the FIRMWARE flag (`make disable`)
+
+`make disable` builds `disable/AUTOEXEC.BIN` from the same source with
+`-DDISABLE_MAINFIRM`: identical guards and `flags_write()` path, but the
+FIRMWARE flag is set to `0xFFFFFFFF` (disabled). That is the state a failed
+update leaves behind, in which the bootloader loads a `.FIR` from the card on
+the next power-on; use it to start a firmware update on a camera whose screen
+or menus don't work. LED codes are the same, with "solid on" meaning the flag
+is now disabled and "slow blink" meaning it already was. Running the default
+`AUTOEXEC.BIN` afterwards re-enables it.
+
+The default build is unchanged by this option (same `AUTOEXEC.BIN`, md5
+`81793732bc34e0cfaa72dbe58028122a`).
+
 ## Test in qemu-eos first
 
 ```
