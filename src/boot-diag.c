@@ -20,7 +20,9 @@
  *   nothing is patched that early. Raw arguments are recorded (no formatting
  *   in the hook), plus the first context switch of every task seen after
  *   capture starts. The heartbeat task writes A:/BOOTDIAG.LOG after ~30 s
- *   and A:/BOOTDIA2.LOG after ~120 s.
+ *   and A:/BOOTDIA2.LOG after ~120 s. On the first Canon ASSERT (e.g. the
+ *   one behind an Err70) capture freezes 256 records later and the
+ *   heartbeat writes A:/BOOTDIA3.LOG with ML's assert message in the header.
  *
  * Addresses are for 5D2 2.1.2 and are checked against the original
  * instruction before hooking.
@@ -114,7 +116,7 @@ static int name_eq(const char *a, const char *b)
 #define MPU_STATUS_REG  0xC022009C      /* polled by Canon's MPU driver itself */
 #define MPU_DRV_STATE   0x88A8          /* driver struct: +0 state (indexes 0x31F44), +8 tx write, +C tx read */
 
-enum { REC_DM = 1, REC_MPU_TX, REC_MPU_RX, REC_TASK, REC_MARK, REC_SIO };
+enum { REC_DM = 1, REC_MPU_TX, REC_MPU_RX, REC_TASK, REC_MARK, REC_SIO, REC_MPU_RXDATA };
 #define NUM_HOOKS 4
 
 struct diag_rec
@@ -128,8 +130,15 @@ struct diag_rec
 /* allocated from Canon's heap once the heartbeat is running (not in BSS:
  * on DIGIC 4, ML's BSS is carved out of Canon's malloc pool) */
 #define LIN_RECS_MAX 4000               /* first records after hooking */
-#define RING_RECS    256                /* most recent records */
+#define RING_RECS    2048               /* most recent records */
 #define CHUNK_SIZE   8192
+
+/* Canon's assert handler (FF8131DC) always logs through this format string,
+ * "\aASSERT : %s, Task = %s" (args: source file, task). On the first one the
+ * ring keeps ASSERT_TAIL_RECS more records and then freezes, so the lead-up
+ * to e.g. an Err70 survives; the heartbeat then writes A:/BOOTDIA3.LOG. */
+#define ADDR_ASSERT_FMT  0xFF81343C
+#define ASSERT_TAIL_RECS 256
 
 static struct diag_rec *lin_buf = 0;
 static struct diag_rec *ring_buf = 0;
@@ -140,13 +149,18 @@ static volatile uint32_t total_n = 0;
 static volatile int capturing = 0;
 static int capture_start_beat = 0;
 
+static volatile int frozen = 0;             /* set ASSERT_TAIL_RECS after the first assert */
+static volatile uint32_t freeze_at = 0;
+static volatile uint32_t assert_rec = 0;    /* record number of the first assert */
+static volatile uint32_t assert_file = 0, assert_task = 0;
+
 #define MAX_SEEN_TASKS 96
 static const char *seen_tasks[MAX_SEEN_TASKS];
 static int num_seen_tasks = 0;
 
 static struct diag_rec *rec_alloc(void)
 {
-    if (!capturing)
+    if (!capturing || frozen)
         return 0;
 
     uint32_t old = cli();
@@ -163,6 +177,8 @@ static struct diag_rec *rec_alloc(void)
         ring_n++;
     }
     total_n++;
+    if (freeze_at && total_n >= freeze_at)
+        frozen = 1;                         /* this record is still written */
     sei(old);
 
     r->t = DIGIC_US();
@@ -180,6 +196,14 @@ static void hook_debugmsg(uint32_t *regs, uint32_t *stack, uint32_t pc)
     r->a[3] = regs[3];      /* arg 0 */
     for (int i = 0; i < 4; i++)
         r->a[4 + i] = stack[i];   /* args 1..4 */
+
+    if (regs[2] == ADDR_ASSERT_FMT && !freeze_at)
+    {
+        assert_rec  = total_n - 1;
+        assert_file = regs[3];
+        assert_task = stack[0];
+        freeze_at   = total_n + ASSERT_TAIL_RECS;
+    }
 }
 
 static void hook_mpu_send(uint32_t *regs, uint32_t *stack, uint32_t pc)
@@ -204,6 +228,27 @@ static void hook_mpu_rx(uint32_t *regs, uint32_t *stack, uint32_t pc)
     r->type = REC_MPU_RX;
     for (int i = 0; i < 8; i++)
         r->a[i] = msg ? msg[i] : 0;
+
+    /* msg: [0] class, [1] id, [2] data pointer, [3] data length.
+     * Copy the data bytes too (up to 2 x 28), e.g. the Init group's 39. */
+    if (!msg)
+        return;
+    const uint8_t *data = (const uint8_t *) msg[2];
+    int len = msg[3];
+    if (!data || len <= 0 || len > 256 ||
+        (uint32_t) data < 0x1000 || (uint32_t) data >= 0x20000000)
+        return;
+    for (int off = 0; off < len && off < 56; off += 28)
+    {
+        struct diag_rec *d = rec_alloc();
+        if (!d) return;
+        d->type = REC_MPU_RXDATA;
+        d->len = MIN(len - off, 28);
+        d->a[0] = off;
+        uint8_t *dst = (uint8_t *) &d->a[1];
+        for (int i = 0; i < 28; i++)
+            dst[i] = (i < d->len) ? data[off + i] : 0;
+    }
 }
 
 /* every SIO3 (MPU link) interrupt, both directions: r0 = word read from the
@@ -244,6 +289,7 @@ static void log_mark(int stage)
 }
 
 extern void *_AllocateMemory(size_t size);
+extern const char *get_assert_msg(void);    /* src/init.c */
 
 static char *chunk = 0;
 
@@ -397,6 +443,15 @@ static void format_rec(const struct diag_rec *r, uint32_t seq)
                      r->a[0], r->a[1], r->a[2], r->a[3], r->a[4], r->a[5], r->a[6], r->a[7]);
             break;
 
+        case REC_MPU_RXDATA:
+        {
+            n += snprintf(line + n, sizeof(line) - n, "MPU<   data +%02d:", r->a[0]);
+            const uint8_t *b = (const uint8_t *) &r->a[1];
+            for (int i = 0; i < r->len && i < 28; i++)
+                n += snprintf(line + n, sizeof(line) - n, " %02x", b[i]);
+            break;
+        }
+
         case REC_TASK:
             snprintf(line + n, sizeof(line) - n, "TASK %s",
                      ptr_ok(r->a[0]) ? (const char *) r->a[0] : "?");
@@ -440,6 +495,29 @@ static void write_log_body(void)
     snprintf(line, sizeof(line), "bootflags %x %x %x %x",
              MEM(0xF8000000), MEM(0xF8000004), MEM(0xF8000008), MEM(0xF800000C));
     emit(line);
+
+    if (freeze_at)
+    {
+        snprintf(line, sizeof(line), "first ASSERT at record %d: %s, task %s; capture %s",
+                 assert_rec,
+                 ptr_ok(assert_file) ? (const char *) assert_file : "?",
+                 ptr_ok(assert_task) ? (const char *) assert_task : "?",
+                 frozen ? "frozen after it" : "still running");
+        emit(line);
+    }
+    else
+    {
+        emit("no ASSERT seen");
+    }
+
+    /* ML's assert handler text (message, file:line, task, backtrace), if any */
+    const char *ml_msg = get_assert_msg();
+    if (ml_msg && ml_msg[0])
+    {
+        emit("---- ML assert message ----");
+        emit(ml_msg);
+        emit("----");
+    }
 
     for (uint32_t i = 0; i < lin_n; i++)
         format_rec(&lin_buf[i], i);
@@ -491,6 +569,12 @@ static int save_log(const char *filename)
  *   param1 = 2: data phase = raw memory, param2 = address, param3 = length (max 1 MiB)
  *   param1 = 3: send PROP_REBOOT to the MPU ~0.5 s after responding;
  *               param2 must be DIAG_REBOOT_MAGIC -> response param: request count
+ *   param1 = 4: ask PropMgr to save the RING store now (prop_saveproperty);
+ *               param2 = 0x02000000, param3 = DIAG_SAVE_MAGIC -> request count
+ *   param1 = 5: response params: save requests, last save result,
+ *               erase requests, erase result, erase verified
+ *   param1 = 6: erase RING bank B (param2 = 0xF0320000, param3 = DIAG_ERASE_MAGIC);
+ *               response param: guard check result (0 = pass)
  * See contrib/recovery/5D2.212/bootdiag_ptp.py
  */
 #include "ptp.h"
@@ -519,6 +603,82 @@ static void diag_reboot_task(void *unused)
     msleep(500);                            /* let the PTP response go out first */
     DryosDebugMsg(0, 15, "[diag] sending PROP_REBOOT (%x = 0)", DIAG_PROP_REBOOT);
     _prop_request_change(DIAG_PROP_REBOOT, &zero, 4);
+}
+
+/*
+ * Ask Canon's property manager to save one FROM data type now, through its
+ * own "prop_saveproperty" eventproc (registered at FF85EE4C, handler
+ * FF85EA4C: reads the data type through its argument pointer and posts event
+ * 15 to PropMgr). Only RING (0x02000000, the user-settings store in ROM0 at
+ * F0310000/F0320000) is allowed. The save itself runs in PropMgr; its
+ * EraseSectorOfRom / WriteToRom messages land in this log.
+ */
+#define DIAG_SAVE_MAGIC     0x53415645      /* "SAVE" */
+#define DIAG_DATATYPE_RING  0x02000000
+
+static volatile int save_requests = 0;
+static volatile int save_result = -12345;
+
+static void diag_save_task(void *unused)
+{
+    /* passed by value: Canon's eventproc dispatcher hands the handler a
+     * pointer to its argument list (first try with &dtype logged
+     * "SaveProperty(<address>)") */
+    uint32_t dtype = DIAG_DATATYPE_RING;
+    msleep(500);
+    DryosDebugMsg(0, 15, "[diag] calling prop_saveproperty(%x)", dtype);
+    save_result = call("prop_saveproperty", dtype);
+    DryosDebugMsg(0, 15, "[diag] prop_saveproperty returned %d", save_result);
+}
+
+/*
+ * Erase RING bank B (F0320000, one 64 KB sector) with Canon's own erase
+ * routine (FF9B47D4, the one PropMgr calls via FF861184 / EraseSectorOfRom).
+ * On this camera every RING slot is used (18 interrupted saves), so PropMgr's
+ * next-write pointer stays on the current copy and no changed setting can be
+ * written. Bank B holds only superseded / partial copies; the valid copy is
+ * bank A slot 0. After this and a restart, PropMgr finds erased slots again.
+ */
+#define DIAG_ERASE_MAGIC    0x45524153      /* "ERAS" */
+#define RING_BANK_A         0xF0310000
+#define RING_BANK_B         0xF0320000
+#define RING_SLOT           0x1000
+#define RING_MARK_VALID     0x0000FFFF
+#define ADDR_ERASE_SECTOR   0xFF9B47D4
+
+static volatile int erase_requests = 0;
+static volatile int erase_result = -12345;  /* FF9B47D4 return, or guard code */
+static volatile int erase_verified = -1;    /* 1 = whole sector reads 0xFFFFFFFF */
+
+static int ring_erase_guards_ok(void)
+{
+    if (MEM(ADDR_ERASE_SECTOR) != 0xE59F2270 || MEM(ADDR_ERASE_SECTOR + 4) != 0xE92D41F0)
+        return -101;                        /* not the 2.1.2 erase routine */
+    if (MEM(RING_BANK_A) != RING_MARK_VALID)
+        return -102;                        /* bank A slot 0 isn't the valid copy */
+    for (int k = 0; k < 16; k++)
+        if (MEM(RING_BANK_B + k * RING_SLOT) == RING_MARK_VALID)
+            return -103;                    /* a valid copy lives in bank B */
+    return 0;
+}
+
+static void diag_erase_task(void *unused)
+{
+    msleep(500);
+    int g = ring_erase_guards_ok();
+    if (g)
+    {
+        erase_result = g;
+        return;
+    }
+    int (*erase_sector)(uint32_t addr) = (void *) ADDR_ERASE_SECTOR;
+    erase_result = erase_sector(RING_BANK_B);
+    sync_caches();
+    int ok = 1;
+    for (uint32_t a = RING_BANK_B; a < RING_BANK_B + 0x10000; a += 4)
+        if (MEM(a) != 0xFFFFFFFF) { ok = 0; break; }
+    erase_verified = ok;
+    DryosDebugMsg(0, 15, "[diag] erase %x -> %d, verified %d", RING_BANK_B, erase_result, ok);
 }
 
 static int diag_send(struct ptp_context *ctx, const char *buf, int size)
@@ -564,7 +724,7 @@ static int diag_ptp_handler(void *priv, struct ptp_context *ctx,
         case 1:
         {
             if (log_busy || !lin_buf) { msg.id = PTP_RC_GeneralError; break; }
-            int max = (lin_n + RING_RECS + 8) * 200;
+            int max = (lin_n + RING_RECS + 8) * 160 + 2048;
             char *buf = _AllocateMemory(max);
             if (!buf) { msg.id = PTP_RC_GeneralError; break; }
             log_busy = 1;
@@ -601,6 +761,43 @@ static int diag_ptp_handler(void *priv, struct ptp_context *ctx,
             task_create("diag_rb", 0x10, 0x1000, diag_reboot_task, 0);
             msg.param_count = 1;
             msg.param[0] = reboot_requests;
+            break;
+
+        case 4:
+            /* param2 = data type (RING only), param3 = DIAG_SAVE_MAGIC */
+            if (param2 != DIAG_DATATYPE_RING || param3 != DIAG_SAVE_MAGIC)
+            {
+                msg.id = PTP_RC_ParameterNotSupported;
+                break;
+            }
+            save_requests++;
+            task_create("diag_sv", 0x10, 0x1000, diag_save_task, 0);
+            msg.param_count = 1;
+            msg.param[0] = save_requests;
+            break;
+
+        case 5:
+            /* results: save requests, last save result, erase requests,
+             * erase result, erase verified */
+            msg.param_count = 5;
+            msg.param[0] = save_requests;
+            msg.param[1] = save_result;
+            msg.param[2] = erase_requests;
+            msg.param[3] = erase_result;
+            msg.param[4] = erase_verified;
+            break;
+
+        case 6:
+            /* param2 = 0xF0320000 (RING bank B only), param3 = DIAG_ERASE_MAGIC */
+            if (param2 != RING_BANK_B || param3 != DIAG_ERASE_MAGIC)
+            {
+                msg.id = PTP_RC_ParameterNotSupported;
+                break;
+            }
+            erase_requests++;
+            task_create("diag_er", 0x10, 0x1000, diag_erase_task, 0);
+            msg.param_count = 1;
+            msg.param[0] = ring_erase_guards_ok();   /* 0 = guards pass now */
             break;
 
         default:
@@ -670,7 +867,7 @@ static void diag_heartbeat_task(void *unused)
     int elapsed_ms = 0;
     int beat = 0;
 #ifdef CONFIG_BOOT_DIAG_LOG
-    int saved1 = 0, saved2 = 0;
+    int saved1 = 0, saved2 = 0, saved3 = 0;
     int hooks_done = 0;
 
     /* buffers and hooks before the first heartbeat, so the ICU<->MPU
@@ -736,6 +933,12 @@ static void diag_heartbeat_task(void *unused)
         if (saved1 && !saved2 && elapsed_ms > 120000 && save_log("A:/BOOTDIA2.LOG"))
         {
             saved2 = 1;
+            diag_blink(5, 100, 100);
+        }
+        /* capture froze after an ASSERT (e.g. Err70): keep that log on the card */
+        if (buffers_ok && frozen && !saved3 && save_log("A:/BOOTDIA3.LOG"))
+        {
+            saved3 = 1;
             diag_blink(5, 100, 100);
         }
 #endif

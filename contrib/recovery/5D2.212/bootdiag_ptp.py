@@ -28,6 +28,12 @@ Usage:
     bootdiag_ptp.py reboot                  (send PROP_REBOOT to the MPU, the last
                                              step of a successful firmware update;
                                              see BOOT-LED-DIAG.md first)
+    bootdiag_ptp.py saveprops               (ask Canon's PropMgr to save the RING
+                                             settings store now; WRITES FLASH)
+    bootdiag_ptp.py saveresult              (results of saveprops / erasering)
+    bootdiag_ptp.py erasering               (erase RING bank B at 0xF0320000 with
+                                             Canon's erase routine; WRITES FLASH;
+                                             refuses unless the guards pass)
 """
 import sys
 import struct
@@ -46,6 +52,10 @@ OP_OPEN_SESSION = 0x1002
 OP_CLOSE_SESSION = 0x1003
 OP_BOOTDIAG = 0xA1D9
 REBOOT_MAGIC = 0x52454254       # "REBT", must match DIAG_REBOOT_MAGIC in src/boot-diag.c
+SAVE_MAGIC = 0x53415645         # "SAVE", must match DIAG_SAVE_MAGIC
+DATATYPE_RING = 0x02000000
+ERASE_MAGIC = 0x45524153        # "ERAS", must match DIAG_ERASE_MAGIC
+RING_BANK_B = 0xF0320000
 RC_OK = 0x2001
 RC_PARAM_NOT_SUPPORTED = 0x2006
 RC_SESSION_ALREADY_OPEN = 0x201E
@@ -162,7 +172,7 @@ class PTP:
 
 
 def main(argv):
-    if len(argv) < 2 or argv[1] not in ("probe", "info", "status", "log", "mem", "reboot"):
+    if len(argv) < 2 or argv[1] not in ("probe", "info", "status", "log", "mem", "reboot", "saveprops", "saveresult", "erasering"):
         sys.exit(__doc__)
     ptp = PTP()
 
@@ -241,6 +251,31 @@ def main(argv):
             print("If the MPU acts on it, the camera restarts and drops off USB. Wait ~15 s,")
             print("replug if it doesn't come back, then run `status` and `log`.")
             print("If it stays up, `log` shows whether the request reached the MPU.")
+        elif argv[1] == "saveprops":
+            rc, p, _ = ptp.transaction(OP_BOOTDIAG, [4, DATATYPE_RING, SAVE_MAGIC])
+            if rc == RC_PARAM_NOT_SUPPORTED:
+                sys.exit("not supported: the diag build on the card predates saveprops")
+            if rc != RC_OK:
+                sys.exit("save request failed: 0x%04x" % rc)
+            print("prop_saveproperty(RING) runs in about 0.5 s (request #%d)." % (p[0] if p else 0))
+            print("Wait a few seconds, then run `saveresult`, `log` and `mem 0xF0310000 0x20000`.")
+        elif argv[1] == "saveresult":
+            rc, p, _ = ptp.transaction(OP_BOOTDIAG, [5])
+            if rc != RC_OK:
+                sys.exit("failed: 0x%04x" % rc)
+            sg = lambda v: struct.unpack("<i", struct.pack("<I", v))[0]
+            print("save requests %d, last prop_saveproperty result %d" % (p[0], sg(p[1])))
+            if len(p) >= 5:
+                print("erase requests %d, erase result %d, verified %d" % (p[2], sg(p[3]), sg(p[4])))
+        elif argv[1] == "erasering":
+            rc, p, _ = ptp.transaction(OP_BOOTDIAG, [6, RING_BANK_B, ERASE_MAGIC])
+            if rc == RC_PARAM_NOT_SUPPORTED:
+                sys.exit("not supported: the diag build on the card predates erasering")
+            if rc != RC_OK:
+                sys.exit("erase request failed: 0x%04x" % rc)
+            g = struct.unpack("<i", struct.pack("<I", p[0]))[0] if p else 0
+            print("erase of RING bank B requested; guard check now: %d (0 = pass, task re-checks)" % g)
+            print("Wait ~5 s, then run `saveresult` and `mem 0xF0320000 0x10000`.")
         elif argv[1] == "log":
             out = argv[2] if len(argv) > 2 else "BOOTDIAG-USB.LOG"
             rc, _, data = ptp.transaction(OP_BOOTDIAG, [1])

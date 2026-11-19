@@ -39,7 +39,8 @@ build allocates its buffers from Canon's heap and installs four hooks:
 
 1. `DryosDebugMsg` (class, level, format and up to 5 arguments)
 2. `mpu_send(buf, size)` (`FF99F518`), first 28 bytes sent to the MPU
-3. the MPU receive analyser (`FF99BA38`), first 8 words of the decoded message
+3. the MPU receive analyser (`FF99BA38`), first 8 words of the decoded message,
+   followed by up to 56 of its data bytes (`MPU<   data +NN:` lines)
 4. the SIO3 interrupt's word handler (`FF99F658`): one `SIO` record per MPU
    link interrupt with the 16-bit word read from the MPU data register
    (0 when the ICU is sending), the MPU status register (`C022009C`), the
@@ -55,10 +56,16 @@ early-after-init install causes trouble, build with `BOOT_DIAG_LATE_HOOKS=y`
 to install one hook per heartbeat instead (1–4 fast flickers before each).
 
 Nothing is formatted inside the hooks; records are stored raw (first up to
-4000 + last 256) and formatted by the heartbeat task, which writes:
+4000 + last 2048) and formatted by the heartbeat task, which writes:
 
 * `A:/BOOTDIAG.LOG` about 30 s after startup
 * `A:/BOOTDIA2.LOG` about 120 s after startup
+* `A:/BOOTDIA3.LOG` at the next heartbeat after Canon's first `ASSERT`
+  (the one behind an Err70, for example). Capture stops 256 records after
+  that assert, so the lead-up stays in the "last records" part, and the header
+  names the assert's source file and task, followed by ML's own assert message
+  with its backtrace. ML's crash handler announces a saved `CRASHnn.LOG` even
+  when creating the file failed; this file goes through a separate save path.
 
 Leave the camera running for at least two minutes (watch for the 5 fast
 blinks), then remove the battery and copy both files off the card.
@@ -79,6 +86,9 @@ build registers PTP opcode `0xA1D9`:
 | 1 | the formatted log (same text as `BOOTDIAG.LOG`) as the data phase |
 | 2 | raw memory: param2 = address, param3 = length (max 1 MiB) |
 | 3 | sends `PROP_REBOOT` to the MPU about 0.5 s after responding; param2 must be `0x52454254` ("REBT"); response param = number of requests so far |
+| 4 | asks Canon's PropMgr to save the RING settings store now (`prop_saveproperty`, data type `0x02000000`); param3 must be `0x53415645` ("SAVE") |
+| 5 | results: save requests, last save result, erase requests, erase result, erase verified |
+| 6 | erases RING bank B (`0xF0320000`) with Canon's erase routine; param3 must be `0x45524153` ("ERAS"); refuses unless the guards pass |
 
 ```
 pip install pyusb libusb-package
@@ -86,6 +96,9 @@ python bootdiag_ptp.py status
 python bootdiag_ptp.py log            # writes BOOTDIAG-USB.LOG
 python bootdiag_ptp.py mem 0xF0310000 0x1000
 python bootdiag_ptp.py reboot         # see "Restarting the MPU" below
+python bootdiag_ptp.py saveprops      # see "Unwedging the RING store" below
+python bootdiag_ptp.py erasering
+python bootdiag_ptp.py saveresult
 ```
 
 On Windows, switch the camera's driver to WinUSB with Zadig first (libusb
@@ -114,6 +127,35 @@ What to look for afterwards:
 * camera stays up: run `log`. The header shows `reboot requests 1`; a
   `[diag] sending PROP_REBOOT` line followed by an `MPU>` record for class 4,
   id 7 (expected `04 04 07 00`) shows the request went out to the MPU.
+
+## Unwedging the RING store (`saveprops`, `erasering`)
+
+The user-settings store (data type `0x02000000`, ROM0 `F0310000`–`F032FFFF`)
+is two 64 KB banks of 16 slots of `0x1000`. Each save writes the next slot.
+Canon only erases a bank when the slot after the next write is the start of
+that bank (`FF861184` calls `EraseSectorOfRom`). After a write it advances to
+the next slot whose first word is `0xFFFFFFFF`, or logs `NOT SEARCH NEXT
+ADDRESS`. On this camera 18 interrupted saves had used every slot, so the
+next-write pointer stayed on the current copy (the RING handle in PropMgr's
+list at RAM `0x2734` showed current = next = `F0310000`), and every changed
+setting failed to save. The failed shutdown save also stopped the card status
+from being cleared, which gave Err70 on every second boot.
+
+* `saveprops` triggers Canon's own save. It writes the RAM image (`Write
+  Addr:0x40530200 Size:2440`) to the next-write slot.
+* `erasering` erases bank B only, with Canon's erase routine (`FF9B47D4`).
+  It checks the routine's first two instructions, that bank A slot 0 holds the
+  valid copy (`0x0000FFFF`), and that no bank B slot does. It then verifies
+  that all 64 KB read `0xFFFFFFFF`.
+
+On the camera the erase returned 0 and verified. On the next boot Canon's
+code wrote a new copy to `F0320000` and marked `F0310000` superseded. After
+that, settings saved and the Err70 stopped. Canon's flash routines disturb the
+ROM hooks while they run, so the log can miss PropMgr messages printed during
+a flash write.
+
+The Err70 capture (`BOOTDIA3.LOG`, freeze on Canon's first `ASSERT`) didn't
+fire for this Err70: it doesn't go through Canon's assert handler.
 
 ## Milestones (N)
 
