@@ -422,6 +422,7 @@ static int save_failures = 0;
 static int ptp_registered = 0;
 static uint32_t ptp_reg_err = 0;
 static volatile uint32_t ptp_calls = 0;
+static volatile int reboot_requests = 0;    /* PTP param1 = 3 */
 
 /* header + all records, through emit(); capture paused by the caller */
 static void write_log_body(void)
@@ -433,8 +434,8 @@ static void write_log_body(void)
     snprintf(line, sizeof(line), "linear buffer %d records; capture started at heartbeat %d; card save failures %d",
              lin_recs, capture_start_beat, save_failures);
     emit(line);
-    snprintf(line, sizeof(line), "ptp: registered %d, register result %x, calls %d",
-             ptp_registered, ptp_reg_err, ptp_calls);
+    snprintf(line, sizeof(line), "ptp: registered %d, register result %x, calls %d, reboot requests %d",
+             ptp_registered, ptp_reg_err, ptp_calls, reboot_requests);
     emit(line);
     snprintf(line, sizeof(line), "bootflags %x %x %x %x",
              MEM(0xF8000000), MEM(0xF8000004), MEM(0xF8000008), MEM(0xF800000C));
@@ -488,6 +489,8 @@ static int save_log(const char *filename)
  *   param1 = 0: status -> response params: stage, hook_errors, total, lin_n, ring_n, save_failures
  *   param1 = 1: data phase = formatted log text (same as BOOTDIAG.LOG)
  *   param1 = 2: data phase = raw memory, param2 = address, param3 = length (max 1 MiB)
+ *   param1 = 3: send PROP_REBOOT to the MPU ~0.5 s after responding;
+ *               param2 must be DIAG_REBOOT_MAGIC -> response param: request count
  * See contrib/recovery/5D2.212/bootdiag_ptp.py
  */
 #include "ptp.h"
@@ -495,6 +498,28 @@ static int save_log(const char *filename)
 #define PTP_CHUNK (128 * 1024)
 
 extern void _FreeMemory(void *ptr);
+
+/*
+ * PROP_REBOOT asks the MPU to restart the camera. Canon's 2.1.2 updater sends
+ * it (value 0, 4 bytes) as the very last step of a successful update, logged
+ * as "_REBOOT ICU -> MPU" (updater 0x806138); the failure path (ABORT_FIRMUP,
+ * "Update file error") never sends it. Canon's main firmware sends the same
+ * request at FF92F824. Canon's stub is called directly: ML's
+ * prop_request_change() wrapper needs ML's property tables, which this
+ * hung camera may never initialise.
+ */
+#define DIAG_PROP_REBOOT    0x80010003
+#define DIAG_REBOOT_MAGIC   0x52454254      /* "REBT": guards against a stray call */
+
+extern void _prop_request_change(unsigned property, const void *addr, size_t len);
+
+static void diag_reboot_task(void *unused)
+{
+    static int zero = 0;
+    msleep(500);                            /* let the PTP response go out first */
+    DryosDebugMsg(0, 15, "[diag] sending PROP_REBOOT (%x = 0)", DIAG_PROP_REBOOT);
+    _prop_request_change(DIAG_PROP_REBOOT, &zero, 4);
+}
 
 static int diag_send(struct ptp_context *ctx, const char *buf, int size)
 {
@@ -564,6 +589,18 @@ static int diag_ptp_handler(void *priv, struct ptp_context *ctx,
             }
             if (!diag_send(ctx, (const char *) param2, param3))
                 msg.id = PTP_RC_GeneralError;
+            break;
+
+        case 3:
+            if (param2 != DIAG_REBOOT_MAGIC)
+            {
+                msg.id = PTP_RC_ParameterNotSupported;
+                break;
+            }
+            reboot_requests++;
+            task_create("diag_rb", 0x10, 0x1000, diag_reboot_task, 0);
+            msg.param_count = 1;
+            msg.param[0] = reboot_requests;
             break;
 
         default:

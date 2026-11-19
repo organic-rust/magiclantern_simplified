@@ -78,17 +78,42 @@ build registers PTP opcode `0xA1D9`:
 | 0 | status in the response parameters: stage, hook errors, records, linear count, ring count |
 | 1 | the formatted log (same text as `BOOTDIAG.LOG`) as the data phase |
 | 2 | raw memory: param2 = address, param3 = length (max 1 MiB) |
+| 3 | sends `PROP_REBOOT` to the MPU about 0.5 s after responding; param2 must be `0x52454254` ("REBT"); response param = number of requests so far |
 
 ```
 pip install pyusb libusb-package
 python bootdiag_ptp.py status
 python bootdiag_ptp.py log            # writes BOOTDIAG-USB.LOG
 python bootdiag_ptp.py mem 0xF0310000 0x1000
+python bootdiag_ptp.py reboot         # see "Restarting the MPU" below
 ```
 
 On Windows, switch the camera's driver to WinUSB with Zadig first (libusb
 can't open the default WIA/MTP driver); see the comments at the top of the
 script for undoing that.
+
+## Restarting the MPU (`reboot`)
+
+Canon's updater ends a successful update by sending `PROP_REBOOT`
+(`0x80010003`, value 0, 4 bytes; logged as `_REBOOT ICU -> MPU`, 2.1.2
+updater `0x806138`) so the MPU restarts into its newly written program. The
+failure path (`ABORT_FIRMUP`, the "Update file error" screen) skips it. This
+camera's failed updates all reached the MPU pieces (pieces 1–2 of 7, sent
+first) and then aborted in the final script, so the MPU never got that request.
+
+`bootdiag_ptp.py reboot` sends exactly that request, through Canon's own
+`_prop_request_change` stub (`FF85F228`); Canon's main firmware makes the same
+call at `FF92F824`, and ML's `src/debug.c` uses it to reboot cameras.
+
+What to look for afterwards:
+
+* camera drops off USB and comes back: run `log` again and compare the MPU
+  traffic with the previous boot. A healthy 5D2 MPU answers `Init` with about
+  19 status messages and then a 42-byte (`2c 2a 02 00 …`) Init group; this
+  camera has been sending only a 40-byte one (`2a 28 02 00 …`).
+* camera stays up: run `log`. The header shows `reboot requests 1`; a
+  `[diag] sending PROP_REBOOT` line followed by an `MPU>` record for class 4,
+  id 7 (expected `04 04 07 00`) shows the request went out to the MPU.
 
 ## Milestones (N)
 

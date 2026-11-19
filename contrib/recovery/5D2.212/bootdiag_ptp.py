@@ -25,6 +25,9 @@ Usage:
     bootdiag_ptp.py status
     bootdiag_ptp.py log  [out.txt]          (default BOOTDIAG-USB.LOG)
     bootdiag_ptp.py mem  ADDR LEN [out.bin] (hex or decimal)
+    bootdiag_ptp.py reboot                  (send PROP_REBOOT to the MPU, the last
+                                             step of a successful firmware update;
+                                             see BOOT-LED-DIAG.md first)
 """
 import sys
 import struct
@@ -42,7 +45,9 @@ CANON_VID = 0x04A9
 OP_OPEN_SESSION = 0x1002
 OP_CLOSE_SESSION = 0x1003
 OP_BOOTDIAG = 0xA1D9
+REBOOT_MAGIC = 0x52454254       # "REBT", must match DIAG_REBOOT_MAGIC in src/boot-diag.c
 RC_OK = 0x2001
+RC_PARAM_NOT_SUPPORTED = 0x2006
 RC_SESSION_ALREADY_OPEN = 0x201E
 TYPE_COMMAND, TYPE_DATA, TYPE_RESPONSE = 1, 2, 3
 TIMEOUT_MS = 5000
@@ -157,7 +162,7 @@ class PTP:
 
 
 def main(argv):
-    if len(argv) < 2 or argv[1] not in ("probe", "info", "status", "log", "mem"):
+    if len(argv) < 2 or argv[1] not in ("probe", "info", "status", "log", "mem", "reboot"):
         sys.exit(__doc__)
     ptp = PTP()
 
@@ -226,6 +231,16 @@ def main(argv):
             names = ("stage", "hook_errors", "records", "linear", "ring")
             for n, v in zip(names, p):
                 print("%-12s %d (0x%x)" % (n, v, v))
+        elif argv[1] == "reboot":
+            rc, p, _ = ptp.transaction(OP_BOOTDIAG, [3, REBOOT_MAGIC])
+            if rc == RC_PARAM_NOT_SUPPORTED:
+                sys.exit("not supported: the diag build on the card predates the reboot command")
+            if rc != RC_OK:
+                sys.exit("reboot request failed: 0x%04x" % rc)
+            print("PROP_REBOOT goes to the MPU in about 0.5 s (request #%d)." % (p[0] if p else 0))
+            print("If the MPU acts on it, the camera restarts and drops off USB. Wait ~15 s,")
+            print("replug if it doesn't come back, then run `status` and `log`.")
+            print("If it stays up, `log` shows whether the request reached the MPU.")
         elif argv[1] == "log":
             out = argv[2] if len(argv) > 2 else "BOOTDIAG-USB.LOG"
             rc, _, data = ptp.transaction(OP_BOOTDIAG, [1])
